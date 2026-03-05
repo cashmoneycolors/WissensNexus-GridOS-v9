@@ -374,6 +374,44 @@ Nutzen:
 - Replay kann gezielt und risikoarm gesteuert werden (statt pauschalem Requeue)
 - Operative Last- und Queue-Zustaende sind sofort im Frontend sichtbar
 
+## 18) Stufe 9: Persistente Ops-Historie + Auto-Alerts auf Queue/Latency-Spikes
+
+Datei: `server/db.mjs`, `server/index.mjs`, `src/components/Dashboard.tsx`
+
+Umgesetzt:
+
+- Persistente Ops-Historie
+  - Neue Tabelle `ops_history` mit Zeitreihe fuer:
+    - Worker/Webhook Utilization
+    - Pending/Failed Queue
+    - Avg/P95 Latenz
+    - Error-Rate
+  - Monitoring-Zyklus (`OPS_MONITOR_INTERVAL_MS`) speichert fortlaufend Snapshots
+- Auto-Alerts bei Queue/Latency-Spikes
+  - Neue Tabelle `ops_alerts`
+  - Regeln fuer:
+    - Pending Queue zu hoch
+    - Failed Queue zu hoch
+    - p95 Latenz ueber Schwelle
+    - Error-Rate ueber Schwelle
+  - Cooldown gegen Alert-Spam
+- Steuerbare Ops-Thresholds + APIs
+  - `GET/PUT /api/ops/thresholds`
+  - `GET /api/ops/history`
+  - `GET /api/ops/alerts`
+  - `POST /api/ops/alerts/ack_all`
+  - `POST /api/ops/monitor/run`
+- Dashboard erweitert
+  - Persistierte Ops-History sichtbar
+  - Offene Ops-Alerts + Ack-All
+  - Threshold-Editor fuer Queue/Latenz/Error-Rate
+
+Nutzen:
+
+- Operative Probleme werden frueh erkannt (statt erst bei Ausfall)
+- Last-/Queue-Verhalten ist historisch nachvollziehbar
+- Schwellwerte sind ohne Codeaenderung direkt im UI anpassbar
+
 ## Bekannte Folgeaenderung
 
 Datei: `server/data.sqlite`
@@ -389,7 +427,7 @@ Datei: `server/data.sqlite`
 
 ## Nächste Optimierungsstufe (optional)
 
-1. Persistente Ops-Historie fuer Backpressure-Metriken (Trend statt Punktwerte).
-2. Automatische Alert-Regeln bei hoher Queue-Latenz oder steigender Error-Rate.
+1. Ops-Alert Eskalation (Warnung -> Critical -> Auto-Action) mit abgestuften Policies.
+2. Replay-Rate-Limiting pro Provider/Event-Typ fuer noch feinere Lastkontrolle.
 3. PayPal-Sandbox/Live-Umschaltung fuer native Verify-API per Runtime-Setting.
-4. Replay-Rate-Limiting pro Provider/Event-Typ fuer noch feinere Lastkontrolle.
+4. Aggregierte Daily/Ops-Reports fuer Management-Review (CSV/JSON Export).

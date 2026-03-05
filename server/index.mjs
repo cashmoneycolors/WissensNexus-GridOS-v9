@@ -75,6 +75,8 @@ const WORKER_INTERVAL_MS = 15000;
 const ASSETS_PER_CYCLE = 3;
 const WEBHOOK_PROCESS_INTERVAL_MS = Number(process.env.WEBHOOK_PROCESS_INTERVAL_MS || 5000);
 const WEBHOOK_JOB_BATCH_SIZE = Number(process.env.WEBHOOK_JOB_BATCH_SIZE || 5);
+const OPS_MONITOR_INTERVAL_MS = Number(process.env.OPS_MONITOR_INTERVAL_MS || 30000);
+const OPS_HISTORY_RETENTION = Number(process.env.OPS_HISTORY_RETENTION || 2000);
 const DEFAULT_CATALOG = [
   { category: 'MICRO_SAAS', price: 49.00, currency: 'CHF' },
   { category: 'SEO_CONTENT', price: 29.00, currency: 'CHF' },
@@ -499,6 +501,7 @@ const ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 const PAYPAL_WEBHOOK_ID = String(process.env.PAYPAL_WEBHOOK_ID || '');
 const PAYPAL_API_BASE = String(process.env.PAYPAL_API_BASE || 'https://api-m.paypal.com');
+const OPS_ALERT_COOLDOWN_MS = Number(process.env.OPS_ALERT_COOLDOWN_MS || 30 * 60 * 1000);
 
 function normalizeExecutiveRole(rawRole) {
   const role = String(rawRole || '').trim().toUpperCase();
@@ -1519,6 +1522,163 @@ function getReplayPolicy() {
   };
 }
 
+function getOpsAlertThresholds() {
+  const pendingJobs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_alert_pending_jobs_threshold'])?.value || 60);
+  const failedJobs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_alert_failed_jobs_threshold'])?.value || 5);
+  const p95LatencyMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_alert_p95_latency_ms_threshold'])?.value || 700);
+  const errorRate = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_alert_error_rate_threshold'])?.value || 0.05);
+
+  return {
+    pendingJobs: Number.isFinite(pendingJobs) ? Math.max(1, pendingJobs) : 60,
+    failedJobs: Number.isFinite(failedJobs) ? Math.max(1, failedJobs) : 5,
+    p95LatencyMs: Number.isFinite(p95LatencyMs) ? Math.max(100, p95LatencyMs) : 700,
+    errorRate: Number.isFinite(errorRate) ? Math.max(0.001, Math.min(1, errorRate)) : 0.05
+  };
+}
+
+function getOpsSnapshot() {
+  const pendingJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['pending'])?.c || 0);
+  const failedJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['failed'])?.c || 0);
+
+  const workerUtilization = Math.min(
+    100,
+    Math.round((Number(workerCycleLastDurationMs || 0) / Math.max(1, Number(WORKER_INTERVAL_MS || 1))) * 100)
+  );
+  const webhookUtilization = Math.min(
+    100,
+    Math.round((Number(webhookProcessorLastDurationMs || 0) / Math.max(1, Number(WEBHOOK_PROCESS_INTERVAL_MS || 1))) * 100)
+  );
+
+  const since = Date.now() - 5 * 60 * 1000;
+  const traces = all('SELECT latency_ms, ok FROM request_traces WHERE created_at >= ? ORDER BY created_at DESC LIMIT 500', [since]);
+  const total = traces.length;
+  const latencies = traces.map((t) => Number(t.latency_ms || 0)).sort((a, b) => a - b);
+  const avgLatencyMs = total > 0 ? latencies.reduce((s, v) => s + v, 0) / total : 0;
+  const p95LatencyMs = total > 0 ? latencies[Math.max(0, Math.floor(total * 0.95) - 1)] : 0;
+  const errCount = traces.filter((t) => Number(t.ok || 0) === 0).length;
+  const errorRate = total > 0 ? errCount / total : 0;
+
+  return {
+    workerUtilization,
+    webhookUtilization,
+    pendingJobs,
+    failedJobs,
+    avgLatencyMs: Number(avgLatencyMs.toFixed(2)),
+    p95LatencyMs: Number(Number(p95LatencyMs || 0).toFixed(2)),
+    errorRate: Number(errorRate.toFixed(4)),
+    createdAt: Date.now()
+  };
+}
+
+function persistOpsSnapshot(snapshot) {
+  run(
+    'INSERT INTO ops_history (id, worker_utilization, webhook_utilization, pending_jobs, failed_jobs, avg_latency_ms, p95_latency_ms, error_rate, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      `ops_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      Number(snapshot.workerUtilization || 0),
+      Number(snapshot.webhookUtilization || 0),
+      Number(snapshot.pendingJobs || 0),
+      Number(snapshot.failedJobs || 0),
+      Number(snapshot.avgLatencyMs || 0),
+      Number(snapshot.p95LatencyMs || 0),
+      Number(snapshot.errorRate || 0),
+      Number(snapshot.createdAt || Date.now())
+    ]
+  );
+
+  run(
+    'DELETE FROM ops_history WHERE id IN (SELECT id FROM ops_history ORDER BY created_at DESC LIMIT -1 OFFSET ?)',
+    [OPS_HISTORY_RETENTION]
+  );
+}
+
+function createOpsAlert({ kind, severity, title, message, snapshot }) {
+  const existing = get(
+    'SELECT id FROM ops_alerts WHERE kind = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1',
+    [kind, Date.now() - OPS_ALERT_COOLDOWN_MS]
+  );
+  if (existing) return null;
+
+  const id = `ops_alert_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  run(
+    'INSERT INTO ops_alerts (id, kind, severity, title, message, snapshot_json, acknowledged, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      id,
+      kind,
+      severity,
+      title,
+      message,
+      JSON.stringify(snapshot),
+      0,
+      Date.now()
+    ]
+  );
+  const row = get('SELECT * FROM ops_alerts WHERE id = ?', [id]);
+  broadcast('ops:alert', row);
+  return row;
+}
+
+function evaluateOpsAlerts(snapshot) {
+  const thresholds = getOpsAlertThresholds();
+  const alerts = [];
+
+  if (snapshot.failedJobs > thresholds.failedJobs) {
+    const alert = createOpsAlert({
+      kind: 'ops_failed_jobs',
+      severity: snapshot.failedJobs > thresholds.failedJobs * 2 ? 'critical' : 'high',
+      title: 'Webhook Dead-Letter ansteigend',
+      message: `Failed Jobs ${snapshot.failedJobs} ueber Schwelle ${thresholds.failedJobs}.`,
+      snapshot
+    });
+    if (alert) alerts.push(alert);
+  }
+
+  if (snapshot.pendingJobs > thresholds.pendingJobs) {
+    const alert = createOpsAlert({
+      kind: 'ops_pending_jobs',
+      severity: snapshot.pendingJobs > thresholds.pendingJobs * 2 ? 'critical' : 'high',
+      title: 'Webhook Queue-Backlog',
+      message: `Pending Jobs ${snapshot.pendingJobs} ueber Schwelle ${thresholds.pendingJobs}.`,
+      snapshot
+    });
+    if (alert) alerts.push(alert);
+  }
+
+  if (snapshot.p95LatencyMs > thresholds.p95LatencyMs) {
+    const alert = createOpsAlert({
+      kind: 'ops_p95_latency',
+      severity: snapshot.p95LatencyMs > thresholds.p95LatencyMs * 1.5 ? 'critical' : 'high',
+      title: 'API-Latenz Spike (p95)',
+      message: `p95 ${snapshot.p95LatencyMs.toFixed(1)}ms ueber Schwelle ${thresholds.p95LatencyMs}ms.`,
+      snapshot
+    });
+    if (alert) alerts.push(alert);
+  }
+
+  if (snapshot.errorRate > thresholds.errorRate) {
+    const alert = createOpsAlert({
+      kind: 'ops_error_rate',
+      severity: snapshot.errorRate > thresholds.errorRate * 2 ? 'critical' : 'high',
+      title: 'API-Error-Rate Spike',
+      message: `Error-Rate ${(snapshot.errorRate * 100).toFixed(2)}% ueber Schwelle ${(thresholds.errorRate * 100).toFixed(2)}%.`,
+      snapshot
+    });
+    if (alert) alerts.push(alert);
+  }
+
+  return alerts;
+}
+
+function runOpsMonitoringCycle() {
+  const snapshot = getOpsSnapshot();
+  persistOpsSnapshot(snapshot);
+  const alerts = evaluateOpsAlerts(snapshot);
+  if (alerts.length > 0) {
+    broadcast('ops:monitor', { snapshot, alertsCreated: alerts.length });
+  }
+  return { snapshot, alertsCreated: alerts.length };
+}
+
 function computeBackoffDelay(attempts) {
   const policy = getReplayPolicy();
   return Math.min(policy.maxDelayMs, policy.baseDelayMs * Math.pow(2, Math.max(0, Number(attempts || 0))));
@@ -1756,6 +1916,23 @@ async function processWebhookJobsGuarded() {
 setInterval(() => {
   void processWebhookJobsGuarded();
 }, WEBHOOK_PROCESS_INTERVAL_MS);
+
+setInterval(() => {
+  try {
+    void runOpsMonitoringCycle();
+  } catch (err) {
+    console.error('[OpsMonitor] Error:', err);
+  }
+}, OPS_MONITOR_INTERVAL_MS);
+
+setTimeout(() => {
+  try {
+    void runOpsMonitoringCycle();
+  } catch (err) {
+    console.error('[OpsMonitor:init] Error:', err);
+  }
+}, 2000);
+
 setInterval(() => {
   try {
     void runEnterpriseIntelligenceCycle();
@@ -2308,6 +2485,7 @@ app.get('/api/ops/backpressure', async () => {
   const pendingJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['pending'])?.c || 0);
   const failedJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['failed'])?.c || 0);
   return {
+    snapshot: getOpsSnapshot(),
     worker: {
       busy: workerCycleBusy,
       runs: workerCycleRuns,
@@ -2327,8 +2505,54 @@ app.get('/api/ops/backpressure', async () => {
       pendingJobs,
       failedJobs
     },
-    replayPolicy: getReplayPolicy()
+    replayPolicy: getReplayPolicy(),
+    opsThresholds: getOpsAlertThresholds()
   };
+});
+
+app.get('/api/ops/history', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 120);
+  const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(2000, limitRaw)) : 120;
+  return all('SELECT * FROM ops_history ORDER BY created_at DESC LIMIT ?', [limit]);
+});
+
+app.get('/api/ops/alerts', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 50);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 50;
+  const onlyOpen = String(req.query?.onlyOpen || '').toLowerCase() === 'true';
+  if (onlyOpen) {
+    return all('SELECT * FROM ops_alerts WHERE acknowledged = 0 ORDER BY created_at DESC LIMIT ?', [limit]);
+  }
+  return all('SELECT * FROM ops_alerts ORDER BY created_at DESC LIMIT ?', [limit]);
+});
+
+app.post('/api/ops/alerts/ack_all', async () => {
+  run('UPDATE ops_alerts SET acknowledged = 1 WHERE acknowledged = 0');
+  return { ok: true };
+});
+
+app.get('/api/ops/thresholds', async () => getOpsAlertThresholds());
+
+app.put('/api/ops/thresholds', async (req, reply) => {
+  const current = getOpsAlertThresholds();
+  const { pendingJobs, failedJobs, p95LatencyMs, errorRate } = req.body ?? {};
+
+  const next = {
+    pendingJobs: Number.isFinite(Number(pendingJobs)) ? Math.max(1, Number(pendingJobs)) : current.pendingJobs,
+    failedJobs: Number.isFinite(Number(failedJobs)) ? Math.max(1, Number(failedJobs)) : current.failedJobs,
+    p95LatencyMs: Number.isFinite(Number(p95LatencyMs)) ? Math.max(100, Number(p95LatencyMs)) : current.p95LatencyMs,
+    errorRate: Number.isFinite(Number(errorRate)) ? Math.max(0.001, Math.min(1, Number(errorRate))) : current.errorRate
+  };
+
+  setGlobalSetting('ops_alert_pending_jobs_threshold', next.pendingJobs);
+  setGlobalSetting('ops_alert_failed_jobs_threshold', next.failedJobs);
+  setGlobalSetting('ops_alert_p95_latency_ms_threshold', next.p95LatencyMs);
+  setGlobalSetting('ops_alert_error_rate_threshold', next.errorRate);
+  return next;
+});
+
+app.post('/api/ops/monitor/run', async () => {
+  return runOpsMonitoringCycle();
 });
 
 app.get('/api/download/:token', async (req, reply) => {

@@ -27,6 +27,16 @@ type WebhookJob = {
 };
 
 type BackpressureSnapshot = {
+  snapshot?: {
+    workerUtilization: number;
+    webhookUtilization: number;
+    pendingJobs: number;
+    failedJobs: number;
+    avgLatencyMs: number;
+    p95LatencyMs: number;
+    errorRate: number;
+    createdAt: number;
+  };
   worker: {
     busy: boolean;
     runs: number;
@@ -51,6 +61,36 @@ type BackpressureSnapshot = {
     maxDelayMs: number;
     batchSize: number;
   };
+  opsThresholds?: OpsThresholds;
+};
+
+type OpsHistoryRow = {
+  id: string;
+  worker_utilization: number;
+  webhook_utilization: number;
+  pending_jobs: number;
+  failed_jobs: number;
+  avg_latency_ms: number;
+  p95_latency_ms: number;
+  error_rate: number;
+  created_at: number;
+};
+
+type OpsAlertRow = {
+  id: string;
+  kind: string;
+  severity: string;
+  title: string;
+  message: string;
+  acknowledged: number;
+  created_at: number;
+};
+
+type OpsThresholds = {
+  pendingJobs: number;
+  failedJobs: number;
+  p95LatencyMs: number;
+  errorRate: number;
 };
 
 function formatMoneyCHF(value: number) {
@@ -67,6 +107,9 @@ export default function Dashboard({ metrics }: Props) {
   const [telemetry, setTelemetry] = useState<TelemetrySummary | null>(null);
   const [deadLetter, setDeadLetter] = useState<WebhookJob[]>([]);
   const [ops, setOps] = useState<BackpressureSnapshot | null>(null);
+  const [opsHistory, setOpsHistory] = useState<OpsHistoryRow[]>([]);
+  const [opsAlerts, setOpsAlerts] = useState<OpsAlertRow[]>([]);
+  const [opsThresholds, setOpsThresholds] = useState<OpsThresholds>({ pendingJobs: 60, failedJobs: 5, p95LatencyMs: 700, errorRate: 0.05 });
   const [providerFilter, setProviderFilter] = useState('');
   const [eventFilter, setEventFilter] = useState('');
   const [replayStrategy, setReplayStrategy] = useState<'reset' | 'preserve' | 'backoff'>('backoff');
@@ -89,11 +132,18 @@ export default function Dashboard({ metrics }: Props) {
       apiGet<BackpressureSnapshot>('/api/ops/backpressure')
         .then((bp) => {
           setOps(bp);
+          if (bp?.opsThresholds) setOpsThresholds(bp.opsThresholds);
           if (bp?.replayPolicy?.batchSize && !Number.isFinite(replayBatchSize)) {
             setReplayBatchSize(bp.replayPolicy.batchSize);
           }
         })
         .catch(() => setOps(null));
+      apiGet<OpsHistoryRow[]>('/api/ops/history?limit=36')
+        .then((rows) => setOpsHistory(Array.isArray(rows) ? rows : []))
+        .catch(() => setOpsHistory([]));
+      apiGet<OpsAlertRow[]>('/api/ops/alerts?onlyOpen=true&limit=8')
+        .then((rows) => setOpsAlerts(Array.isArray(rows) ? rows : []))
+        .catch(() => setOpsAlerts([]));
     };
 
     load();
@@ -146,6 +196,47 @@ export default function Dashboard({ metrics }: Props) {
       setDeadLetter(Array.isArray(rows) ? rows : []);
       const bp = await apiGet<BackpressureSnapshot>('/api/ops/backpressure');
       setOps(bp);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const runOpsMonitorNow = async () => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      await apiSend('/api/ops/monitor/run', 'POST', {});
+      const [bp, history, alerts] = await Promise.all([
+        apiGet<BackpressureSnapshot>('/api/ops/backpressure'),
+        apiGet<OpsHistoryRow[]>('/api/ops/history?limit=36'),
+        apiGet<OpsAlertRow[]>('/api/ops/alerts?onlyOpen=true&limit=8')
+      ]);
+      setOps(bp);
+      setOpsHistory(Array.isArray(history) ? history : []);
+      setOpsAlerts(Array.isArray(alerts) ? alerts : []);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const ackOpsAlerts = async () => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      await apiSend('/api/ops/alerts/ack_all', 'POST', {});
+      const alerts = await apiGet<OpsAlertRow[]>('/api/ops/alerts?onlyOpen=true&limit=8');
+      setOpsAlerts(Array.isArray(alerts) ? alerts : []);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const saveOpsThresholds = async () => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      const next = await apiSend<OpsThresholds>('/api/ops/thresholds', 'PUT', opsThresholds);
+      setOpsThresholds(next);
     } finally {
       setOpsBusy(false);
     }
@@ -358,6 +449,83 @@ export default function Dashboard({ metrics }: Props) {
           </div>
           <div className="mt-2 text-xs text-slate-500">
             Replay Policy: base {ops?.replayPolicy.baseDelayMs ?? 0}ms · max {ops?.replayPolicy.maxDelayMs ?? 0}ms · batch {ops?.replayPolicy.batchSize ?? 0}
+          </div>
+        </Card>
+
+        <Card className="p-4 sm:col-span-2 lg:col-span-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-semibold text-slate-400">Ops History (Persistiert)</div>
+            <Button className="text-xs" onClick={runOpsMonitorNow} disabled={opsBusy}>Run Monitor Now</Button>
+          </div>
+          <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">p95 Latest</div>
+              <div className="font-bold text-slate-100">{Number(ops?.snapshot?.p95LatencyMs || 0).toFixed(1)} ms</div>
+            </div>
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">Queue Pending</div>
+              <div className="font-bold text-slate-100">{ops?.snapshot?.pendingJobs ?? 0}</div>
+            </div>
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">Error Rate</div>
+              <div className="font-bold text-slate-100">{(Number(ops?.snapshot?.errorRate || 0) * 100).toFixed(2)}%</div>
+            </div>
+          </div>
+          <div className="mt-2 max-h-28 overflow-auto custom-scrollbar space-y-1">
+            {opsHistory.slice(0, 10).map((row) => (
+              <div key={row.id} className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs text-slate-300">
+                {new Date(row.created_at).toLocaleTimeString()} · p95 {Number(row.p95_latency_ms).toFixed(0)}ms · err {(Number(row.error_rate) * 100).toFixed(2)}% · q {row.pending_jobs}/{row.failed_jobs}
+              </div>
+            ))}
+            {opsHistory.length === 0 && <div className="text-xs text-slate-500">Noch keine History-Eintraege.</div>}
+          </div>
+        </Card>
+
+        <Card className="p-4 sm:col-span-2 lg:col-span-1">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-semibold text-slate-400">Ops Auto-Alerts</div>
+            <Button className="text-xs" onClick={ackOpsAlerts} disabled={opsBusy || opsAlerts.length === 0}>Ack All</Button>
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <input
+              type="number"
+              value={opsThresholds.pendingJobs}
+              onChange={(e) => setOpsThresholds((p) => ({ ...p, pendingJobs: Number(e.target.value || 0) }))}
+              aria-label="Pending jobs threshold"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            />
+            <input
+              type="number"
+              value={opsThresholds.failedJobs}
+              onChange={(e) => setOpsThresholds((p) => ({ ...p, failedJobs: Number(e.target.value || 0) }))}
+              aria-label="Failed jobs threshold"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            />
+            <input
+              type="number"
+              value={opsThresholds.p95LatencyMs}
+              onChange={(e) => setOpsThresholds((p) => ({ ...p, p95LatencyMs: Number(e.target.value || 0) }))}
+              aria-label="p95 latency threshold"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            />
+            <input
+              type="number"
+              step="0.001"
+              value={opsThresholds.errorRate}
+              onChange={(e) => setOpsThresholds((p) => ({ ...p, errorRate: Number(e.target.value || 0) }))}
+              aria-label="Error rate threshold"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            />
+          </div>
+          <Button className="mt-2 text-xs" onClick={saveOpsThresholds} disabled={opsBusy}>Save Thresholds</Button>
+          <div className="mt-2 max-h-24 overflow-auto custom-scrollbar space-y-1">
+            {opsAlerts.map((a) => (
+              <div key={a.id} className="rounded border border-rose-500/20 bg-rose-950/20 px-2 py-1 text-xs">
+                <div className="font-semibold text-slate-100">{a.title}</div>
+                <div className="text-slate-300">{a.message}</div>
+              </div>
+            ))}
+            {opsAlerts.length === 0 && <div className="text-xs text-slate-500">Keine offenen Ops-Alerts.</div>}
           </div>
         </Card>
       </div>

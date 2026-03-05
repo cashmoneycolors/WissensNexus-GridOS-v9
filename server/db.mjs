@@ -286,6 +286,35 @@ export function migrate() {
       rationale TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS ops_history (
+      id TEXT PRIMARY KEY,
+      worker_utilization REAL NOT NULL,
+      webhook_utilization REAL NOT NULL,
+      pending_jobs INTEGER NOT NULL,
+      failed_jobs INTEGER NOT NULL,
+      avg_latency_ms REAL NOT NULL,
+      p95_latency_ms REAL NOT NULL,
+      error_rate REAL NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ops_history_created_at
+      ON ops_history(created_at);
+
+    CREATE TABLE IF NOT EXISTS ops_alerts (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      acknowledged INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ops_alerts_created_at
+      ON ops_alerts(created_at);
   `);
 
   const ensureColumn = (table, column, def) => {
