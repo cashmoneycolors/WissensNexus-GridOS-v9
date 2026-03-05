@@ -234,6 +234,33 @@ Nutzen:
 - Nachvollziehbare, datenbasierte Preis- und Sales-Entscheidungen
 - Hoher Automatisierungsgrad ohne Kontrollverlust
 
+## 14) Stufe 5: Portfolio Ranker + Smart Budget Allocation + 30/60/90 Simulation
+
+Datei: `server/index.mjs`, `server/db.mjs`, `src/components/PayPalBusiness.tsx`
+
+Umgesetzt:
+
+- Portfolio Ranker
+  - Neue Bewertungsfunktion pro Kategorie (Score aus Umsatz, Conversion, Orders)
+  - API: `GET /api/business/portfolio/rank`
+- Smart Budget Allocation
+  - Budget-Verteilung auf Kategorien anhand Ranking-Bands
+  - API Preview: `GET /api/business/budget/allocation`
+  - Persistenz/Audit: `POST /api/business/budget/allocation/apply`
+  - Letzter Stand: `GET /api/business/budget/allocation/latest`
+  - Neue DB-Tabelle: `budget_allocation_actions`
+- 30/60/90 Business Simulation
+  - Prognose fuer Revenue, Cost, Net, Margin
+  - APIs: `POST /api/business/simulate`, `GET /api/business/simulate/default`
+- Executive-Cockpit UI erweitert
+  - Top-Kategorien, Budget-Preview, Apply-Action, Simulations-Panel
+
+Nutzen:
+
+- Kapitalallokation wird reproduzierbar und datenbasiert
+- Priorisierung umsatzstarker Kategorien statt Bauchgefuehl
+- Schnellere operative Entscheidungen durch 30/60/90-Projektionen
+
 ## Bekannte Folgeaenderung
 Datei: `server/data.sqlite`
 

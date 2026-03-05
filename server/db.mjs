@@ -249,6 +249,14 @@ export function migrate() {
       reason TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS budget_allocation_actions (
+      id TEXT PRIMARY KEY,
+      total_budget REAL NOT NULL,
+      allocation_json TEXT NOT NULL,
+      rationale TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
   `);
 
   const ensureColumn = (table, column, def) => {

@@ -727,6 +727,118 @@ function getBusinessFunnelOverview() {
   };
 }
 
+function getPortfolioRanking(windowDays = 30) {
+  const funnel = getCategoryFunnelMetrics(windowDays);
+  const totalRevenue = funnel.reduce((s, r) => s + r.revenue, 0);
+  const totalOrders = funnel.reduce((s, r) => s + r.orders, 0);
+
+  const ranked = funnel.map((row) => {
+    const revenueShare = totalRevenue > 0 ? row.revenue / totalRevenue : 0;
+    const orderShare = totalOrders > 0 ? row.orders / totalOrders : 0;
+    const volumeSignal = Math.min(1, row.productsCreated / 12);
+    const scoreRaw =
+      revenueShare * 45 +
+      row.conversion * 35 +
+      orderShare * 15 +
+      volumeSignal * 5;
+
+    const score = Number((scoreRaw * 100).toFixed(2));
+    let band = 'watch';
+    if (score >= 45) band = 'core';
+    else if (score >= 22) band = 'grow';
+
+    return {
+      category: row.category,
+      score,
+      band,
+      revenue: row.revenue,
+      orders: row.orders,
+      conversion: row.conversion,
+      productsCreated: row.productsCreated,
+      listedPrice: row.listedPrice
+    };
+  });
+
+  ranked.sort((a, b) => b.score - a.score);
+  return ranked;
+}
+
+function getSmartBudgetAllocation(totalBudget = null) {
+  const dailyBudget = Number(get('SELECT value FROM global_settings WHERE key = ?', ['daily_budget'])?.value || 100);
+  const budget = Number.isFinite(Number(totalBudget)) ? Number(totalBudget) : dailyBudget;
+  const ranking = getPortfolioRanking(30);
+
+  if (!ranking.length) return { totalBudget: budget, allocations: [] };
+
+  const floors = ranking.map((r) => ({ ...r, min: Math.max(5, budget * 0.05) }));
+  const floorTotal = floors.reduce((s, r) => s + r.min, 0);
+  const distributable = Math.max(0, budget - floorTotal);
+  const scoreSum = Math.max(1, floors.reduce((s, r) => s + r.score, 0));
+
+  let allocations = floors.map((r) => {
+    const variablePart = distributable * (r.score / scoreSum);
+    const amount = Number((r.min + variablePart).toFixed(2));
+    return {
+      category: r.category,
+      band: r.band,
+      score: r.score,
+      amount
+    };
+  });
+
+  const currentSum = allocations.reduce((s, r) => s + r.amount, 0);
+  const delta = Number((budget - currentSum).toFixed(2));
+  if (allocations.length > 0 && Math.abs(delta) >= 0.01) {
+    allocations[0] = { ...allocations[0], amount: Number((allocations[0].amount + delta).toFixed(2)) };
+  }
+
+  allocations = allocations.sort((a, b) => b.score - a.score);
+  return {
+    totalBudget: Number(budget.toFixed(2)),
+    allocations,
+    rationale: 'Score-basiert: Revenue-Share, Conversion und Order-Share mit Mindestbudget je Kategorie.'
+  };
+}
+
+function simulateBusinessTrajectory(days = 30, options = {}) {
+  const horizon = Math.max(7, Math.min(180, Math.round(Number(days) || 30)));
+  const snapshot = getBusinessSnapshot();
+  const ranking = getPortfolioRanking(30);
+
+  const baseRevenuePerDay = snapshot.revenue30 / 30;
+  const baseCostPerDay = snapshot.cost30 / 30;
+  const avgScore = ranking.length ? ranking.reduce((s, r) => s + r.score, 0) / ranking.length : 20;
+
+  const growthBias = 1 + Math.min(0.12, avgScore / 1000);
+  const priceDeltaPct = Number(options.priceDeltaPct || 0);
+  const conversionDeltaPct = Number(options.conversionDeltaPct || 0);
+  const costDeltaPct = Number(options.costDeltaPct || 0);
+
+  const revenueFactor = growthBias * (1 + priceDeltaPct) * (1 + conversionDeltaPct);
+  const costFactor = 1 + costDeltaPct;
+
+  const projectedRevenue = Number((baseRevenuePerDay * horizon * revenueFactor).toFixed(2));
+  const projectedCost = Number((baseCostPerDay * horizon * costFactor).toFixed(2));
+  const projectedNet = Number((projectedRevenue - projectedCost).toFixed(2));
+  const projectedMargin = projectedRevenue > 0 ? Number((projectedNet / projectedRevenue).toFixed(4)) : 0;
+
+  return {
+    days: horizon,
+    assumptions: {
+      priceDeltaPct,
+      conversionDeltaPct,
+      costDeltaPct,
+      growthBias: Number(growthBias.toFixed(4))
+    },
+    projection: {
+      revenue: projectedRevenue,
+      cost: projectedCost,
+      net: projectedNet,
+      margin: projectedMargin
+    }
+  };
+}
+
 function getIsoWeekKey(ts = Date.now()) {
   const d = new Date(ts);
   d.setUTCHours(0, 0, 0, 0);
@@ -2051,6 +2163,59 @@ app.get('/api/business/pricing/actions', async (req) => {
   const limitRaw = Number(req.query?.limit ?? 30);
   const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 30;
   return all('SELECT * FROM pricing_actions ORDER BY created_at DESC LIMIT ?', [limit]);
+});
+
+app.get('/api/business/portfolio/rank', async (req) => {
+  const windowDays = Number(req.query?.windowDays ?? 30);
+  return {
+    windowDays: Number.isFinite(windowDays) ? windowDays : 30,
+    ranking: getPortfolioRanking(Number.isFinite(windowDays) ? windowDays : 30)
+  };
+});
+
+app.get('/api/business/budget/allocation', async (req) => {
+  const budget = Number(req.query?.budget);
+  return getSmartBudgetAllocation(Number.isFinite(budget) ? budget : null);
+});
+
+app.post('/api/business/budget/allocation/apply', async (req) => {
+  const { budget } = req.body ?? {};
+  const allocation = getSmartBudgetAllocation(Number.isFinite(Number(budget)) ? Number(budget) : null);
+
+  run(
+    'INSERT INTO budget_allocation_actions (id, total_budget, allocation_json, rationale, created_at) VALUES (?, ?, ?, ?, ?)',
+    [
+      `bal_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      Number(allocation.totalBudget),
+      JSON.stringify(allocation.allocations),
+      String(allocation.rationale || ''),
+      Date.now()
+    ]
+  );
+
+  return allocation;
+});
+
+app.get('/api/business/budget/allocation/latest', async () => {
+  const row = get('SELECT * FROM budget_allocation_actions ORDER BY created_at DESC LIMIT 1');
+  if (!row) return { totalBudget: 0, allocations: [], rationale: 'Noch keine Allokation gespeichert.' };
+  return {
+    totalBudget: Number(row.total_budget || 0),
+    allocations: JSON.parse(String(row.allocation_json || '[]')),
+    rationale: String(row.rationale || ''),
+    createdAt: Number(row.created_at || 0)
+  };
+});
+
+app.post('/api/business/simulate', async (req) => {
+  const { days = 30, priceDeltaPct = 0, conversionDeltaPct = 0, costDeltaPct = 0 } = req.body ?? {};
+  return simulateBusinessTrajectory(days, { priceDeltaPct, conversionDeltaPct, costDeltaPct });
+});
+
+app.get('/api/business/simulate/default', async () => {
+  return {
+    scenarios: [30, 60, 90].map((d) => simulateBusinessTrajectory(d, {}))
+  };
 });
 
 app.get('/api/business/followups/settings', async () => getFollowupSettings());
