@@ -450,6 +450,148 @@ function getAlertThresholds() {
   };
 }
 
+function getAutopricingSettings() {
+  const enabled = Number(get('SELECT value FROM global_settings WHERE key = ?', ['auto_pricing_enabled'])?.value || 0) === 1;
+  const maxStepPct = Number(get('SELECT value FROM global_settings WHERE key = ?', ['auto_pricing_max_step_pct'])?.value || 0.1);
+  const minPriceFloor = Number(get('SELECT value FROM global_settings WHERE key = ?', ['auto_pricing_min_price_floor'])?.value || 5);
+  const conversionTarget = Number(get('SELECT value FROM global_settings WHERE key = ?', ['conversion_target'])?.value || 0.03);
+
+  return {
+    enabled,
+    maxStepPct: Number.isFinite(maxStepPct) ? Math.min(0.25, Math.max(0.01, maxStepPct)) : 0.1,
+    minPriceFloor: Number.isFinite(minPriceFloor) ? Math.max(1, minPriceFloor) : 5,
+    conversionTarget: Number.isFinite(conversionTarget) ? Math.min(0.5, Math.max(0.001, conversionTarget)) : 0.03
+  };
+}
+
+function getCategoryFunnelMetrics(windowDays = 30) {
+  const since = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+
+  const rows = all(
+    `SELECT
+      c.category AS category,
+      c.price AS listed_price,
+      c.currency AS currency,
+      COUNT(p.id) AS products_created,
+      COUNT(o.id) AS orders_count,
+      COALESCE(SUM(o.amount), 0) AS revenue
+     FROM product_catalog c
+     LEFT JOIN products p ON p.category = c.category AND p.created_at >= ?
+     LEFT JOIN orders o ON o.product_id = p.id AND o.created_at >= ?
+     GROUP BY c.category, c.price, c.currency
+     ORDER BY c.category ASC`,
+    [since, since]
+  );
+
+  return rows.map((r) => {
+    const created = Number(r.products_created || 0);
+    const orders = Number(r.orders_count || 0);
+    const revenue = Number(r.revenue || 0);
+    const conversion = created > 0 ? orders / created : 0;
+    const aov = orders > 0 ? revenue / orders : Number(r.listed_price || 0);
+
+    return {
+      category: String(r.category),
+      listedPrice: Number(r.listed_price || 0),
+      currency: String(r.currency || 'CHF'),
+      productsCreated: created,
+      orders,
+      revenue: Number(revenue.toFixed(2)),
+      conversion: Number(conversion.toFixed(4)),
+      aov: Number(aov.toFixed(2))
+    };
+  });
+}
+
+function buildCatalogOptimizationPlan(snapshot) {
+  const settings = getAutopricingSettings();
+  const metrics = getCategoryFunnelMetrics(30);
+  const plan = [];
+
+  for (const item of metrics) {
+    let direction = 'hold';
+    let reason = 'Keine dominante Signalabweichung';
+
+    if (item.orders >= 3 && item.conversion >= settings.conversionTarget * 1.5) {
+      direction = 'increase';
+      reason = 'Starke Nachfrage bei stabiler Conversion';
+    } else if (item.productsCreated >= 4 && item.orders === 0) {
+      direction = 'decrease';
+      reason = 'Mehrere Listings ohne Abschluesse';
+    } else if (item.conversion > 0 && item.conversion < settings.conversionTarget * 0.6) {
+      direction = 'decrease';
+      reason = 'Conversion deutlich unter Zielkorridor';
+    }
+
+    if (snapshot.margin30 < 0.2 && direction === 'decrease') {
+      direction = 'hold';
+      reason = 'Preisabsenkung blockiert: Margenschutz aktiv';
+    }
+
+    const step = Number((item.listedPrice * settings.maxStepPct).toFixed(2));
+    let nextPrice = item.listedPrice;
+    if (direction === 'increase') nextPrice = item.listedPrice + step;
+    if (direction === 'decrease') nextPrice = Math.max(settings.minPriceFloor, item.listedPrice - step);
+
+    plan.push({
+      category: item.category,
+      currentPrice: item.listedPrice,
+      suggestedPrice: Number(nextPrice.toFixed(2)),
+      direction,
+      reason,
+      conversion: item.conversion,
+      orders: item.orders,
+      productsCreated: item.productsCreated
+    });
+  }
+
+  return plan;
+}
+
+function applyCatalogOptimizationPlan(plan) {
+  const applied = [];
+  for (const row of plan) {
+    if (row.direction === 'hold' || row.currentPrice === row.suggestedPrice) continue;
+
+    run('UPDATE product_catalog SET price = ?, updated_at = ? WHERE category = ?', [
+      Number(row.suggestedPrice),
+      Date.now(),
+      row.category
+    ]);
+
+    applied.push(row);
+  }
+
+  return applied;
+}
+
+function getBusinessFunnelOverview() {
+  const byCategory = getCategoryFunnelMetrics(30);
+  const totals = byCategory.reduce(
+    (acc, r) => {
+      acc.products += r.productsCreated;
+      acc.orders += r.orders;
+      acc.revenue += r.revenue;
+      return acc;
+    },
+    { products: 0, orders: 0, revenue: 0 }
+  );
+
+  const conversion = totals.products > 0 ? totals.orders / totals.products : 0;
+  const aov = totals.orders > 0 ? totals.revenue / totals.orders : 0;
+
+  return {
+    window: '30d',
+    productsCreated: totals.products,
+    orders: totals.orders,
+    revenue: Number(totals.revenue.toFixed(2)),
+    conversion: Number(conversion.toFixed(4)),
+    aov: Number(aov.toFixed(2)),
+    conversionTarget: getAutopricingSettings().conversionTarget,
+    byCategory
+  };
+}
+
 function getIsoWeekKey(ts = Date.now()) {
   const d = new Date(ts);
   d.setUTCHours(0, 0, 0, 0);
@@ -525,6 +667,8 @@ function createBusinessAlert({ kind, severity, title, message, snapshot }) {
 
 function evaluateBusinessAlerts(snapshot) {
   const thresholds = getAlertThresholds();
+  const funnel = getBusinessFunnelOverview();
+  const pricing = getAutopricingSettings();
   const alerts = [];
 
   if (snapshot.margin30 < thresholds.margin) {
@@ -560,6 +704,17 @@ function evaluateBusinessAlerts(snapshot) {
     if (alert) alerts.push(alert);
   }
 
+  if (funnel.productsCreated >= 10 && funnel.conversion < pricing.conversionTarget) {
+    const alert = createBusinessAlert({
+      kind: 'conversion',
+      severity: funnel.conversion < pricing.conversionTarget * 0.5 ? 'high' : 'medium',
+      title: 'Conversion unter Zielwert',
+      message: `Conversion ${Number((funnel.conversion * 100).toFixed(2))}% liegt unter Ziel ${Number((pricing.conversionTarget * 100).toFixed(2))}%.`,
+      snapshot: { ...snapshot, conversion: funnel.conversion }
+    });
+    if (alert) alerts.push(alert);
+  }
+
   return alerts;
 }
 
@@ -567,14 +722,33 @@ function runEnterpriseIntelligenceCycle() {
   const snapshot = getBusinessSnapshot();
   const weekly = ensureWeeklyOpsTasks(snapshot);
   const alerts = evaluateBusinessAlerts(snapshot);
-  if (weekly.created > 0 || alerts.length > 0) {
+  const pricingSettings = getAutopricingSettings();
+  const plan = buildCatalogOptimizationPlan(snapshot);
+  const appliedPricing = pricingSettings.enabled ? applyCatalogOptimizationPlan(plan) : [];
+
+  if (appliedPricing.length > 0) {
+    broadcast('business:pricing', {
+      ts: Date.now(),
+      applied: appliedPricing.length,
+      changes: appliedPricing
+    });
+  }
+
+  if (weekly.created > 0 || alerts.length > 0 || appliedPricing.length > 0) {
     broadcast('business:cycle', {
       ts: Date.now(),
       weeklyTasksCreated: weekly.created,
-      alertsCreated: alerts.length
+      alertsCreated: alerts.length,
+      pricingApplied: appliedPricing.length
     });
   }
-  return { snapshot, weeklyTasksCreated: weekly.created, alertsCreated: alerts.length };
+  return {
+    snapshot,
+    weeklyTasksCreated: weekly.created,
+    alertsCreated: alerts.length,
+    pricingPlanCount: plan.length,
+    pricingApplied: appliedPricing.length
+  };
 }
 
 function evaluateArithmeticExpression(input) {
@@ -1670,6 +1844,54 @@ app.put('/api/business/thresholds', async (req, reply) => {
   upsert('alert_critical_tasks_threshold', nextCritical);
 
   return getAlertThresholds();
+});
+
+app.get('/api/business/funnel', async () => {
+  return getBusinessFunnelOverview();
+});
+
+app.get('/api/business/autopricing', async () => {
+  return getAutopricingSettings();
+});
+
+app.put('/api/business/autopricing', async (req) => {
+  const current = getAutopricingSettings();
+  const { enabled, maxStepPct, minPriceFloor, conversionTarget } = req.body ?? {};
+
+  const next = {
+    enabled: typeof enabled === 'boolean' ? enabled : current.enabled,
+    maxStepPct: Number.isFinite(Number(maxStepPct)) ? Number(maxStepPct) : current.maxStepPct,
+    minPriceFloor: Number.isFinite(Number(minPriceFloor)) ? Number(minPriceFloor) : current.minPriceFloor,
+    conversionTarget: Number.isFinite(Number(conversionTarget)) ? Number(conversionTarget) : current.conversionTarget
+  };
+
+  const upsert = (key, value) => {
+    const existing = get('SELECT value FROM global_settings WHERE key = ?', [key]);
+    if (existing) run('UPDATE global_settings SET value = ? WHERE key = ?', [String(value), key]);
+    else run('INSERT INTO global_settings (key, value) VALUES (?, ?)', [key, String(value)]);
+  };
+
+  upsert('auto_pricing_enabled', next.enabled ? 1 : 0);
+  upsert('auto_pricing_max_step_pct', next.maxStepPct);
+  upsert('auto_pricing_min_price_floor', next.minPriceFloor);
+  upsert('conversion_target', next.conversionTarget);
+
+  return getAutopricingSettings();
+});
+
+app.get('/api/business/autopricing/plan', async () => {
+  const snapshot = getBusinessSnapshot();
+  return {
+    settings: getAutopricingSettings(),
+    plan: buildCatalogOptimizationPlan(snapshot)
+  };
+});
+
+app.post('/api/business/autopricing/apply', async () => {
+  const snapshot = getBusinessSnapshot();
+  const plan = buildCatalogOptimizationPlan(snapshot);
+  const applied = applyCatalogOptimizationPlan(plan);
+  return { applied, count: applied.length };
 });
 
 app.get('/api/business/alerts', async (req) => {

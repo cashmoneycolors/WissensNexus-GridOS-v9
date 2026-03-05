@@ -425,7 +425,11 @@ export function seedIfEmpty() {
     ['alert_runway_days_threshold', '90'],
     ['alert_critical_tasks_threshold', '25'],
     ['weekly_ops_enabled', '1'],
-    ['weekly_ops_last_key', '']
+    ['weekly_ops_last_key', ''],
+    ['auto_pricing_enabled', '0'],
+    ['auto_pricing_max_step_pct', '0.10'],
+    ['auto_pricing_min_price_floor', '5'],
+    ['conversion_target', '0.03']
   ];
 
   for (const [key, value] of defaults) {

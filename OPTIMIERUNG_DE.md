@@ -176,6 +176,38 @@ Nutzen:
 - Woechentliche Steuerungsroutine laeuft autonom
 - Risiken werden als Alerts frueh sichtbar und nachvollziehbar gespeichert
 
+## 12) Stufe 3: Funnel- und Auto-Pricing-Optimierung
+
+Datei: `server/index.mjs`, `server/db.mjs`
+
+Umgesetzt:
+
+- Funnel-Analyse fuer 30 Tage (global + pro Kategorie)
+  - Metriken: `productsCreated`, `orders`, `revenue`, `conversion`, `aov`
+  - API: `GET /api/business/funnel`
+- Auto-Pricing mit Guardrails
+  - Schalter + Parameter in `global_settings`:
+    - `auto_pricing_enabled`
+    - `auto_pricing_max_step_pct`
+    - `auto_pricing_min_price_floor`
+    - `conversion_target`
+  - APIs:
+    - `GET/PUT /api/business/autopricing`
+    - `GET /api/business/autopricing/plan`
+    - `POST /api/business/autopricing/apply`
+- Enterprise-Zyklus erweitert:
+  - bewertet automatisch Pricing-Plan
+  - wendet Preisanpassungen an (wenn aktiviert)
+  - sendet Events fuer Pricing-Aenderungen
+- Neues Alert-Signal:
+  - `conversion`-Alert bei Unterperformance gegen Zielkorridor
+
+Nutzen:
+
+- Preisentscheidungen werden datengetrieben und begrenzt (kein unkontrolliertes Dumping)
+- Funnel-Leistung wird kontinuierlich beobachtet
+- Autonomes Nachsteuern fuer bessere Abschlussquote und Umsatzqualitaet
+
 ## Bekannte Folgeaenderung
 Datei: `server/data.sqlite`
 
