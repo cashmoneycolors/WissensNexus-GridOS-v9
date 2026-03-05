@@ -464,6 +464,18 @@ function getAutopricingSettings() {
   };
 }
 
+function getFollowupSettings() {
+  const enabled = Number(get('SELECT value FROM global_settings WHERE key = ?', ['followup_enabled'])?.value || 1) === 1;
+  const intervalHours = Number(get('SELECT value FROM global_settings WHERE key = ?', ['followup_interval_hours'])?.value || 48);
+  const maxTouchpoints = Number(get('SELECT value FROM global_settings WHERE key = ?', ['followup_max_touchpoints'])?.value || 5);
+
+  return {
+    enabled,
+    intervalHours: Number.isFinite(intervalHours) ? Math.min(240, Math.max(12, intervalHours)) : 48,
+    maxTouchpoints: Number.isFinite(maxTouchpoints) ? Math.min(12, Math.max(1, maxTouchpoints)) : 5
+  };
+}
+
 function getCategoryFunnelMetrics(windowDays = 30) {
   const since = Date.now() - windowDays * 24 * 60 * 60 * 1000;
 
@@ -559,10 +571,133 @@ function applyCatalogOptimizationPlan(plan) {
       row.category
     ]);
 
+    run(
+      'INSERT INTO pricing_actions (id, category, previous_price, new_price, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [
+        `price_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        row.category,
+        Number(row.currentPrice),
+        Number(row.suggestedPrice),
+        row.reason,
+        Date.now()
+      ]
+    );
+
     applied.push(row);
   }
 
   return applied;
+}
+
+function queueFollowupActions(snapshot) {
+  const settings = getFollowupSettings();
+  if (!settings.enabled) return [];
+
+  const nowTs = Date.now();
+  const dueLeads = all(
+    `SELECT l.*, COALESCE((SELECT COUNT(*) FROM followup_actions f WHERE f.lead_id = l.id), 0) AS touchpoints
+     FROM leads l
+     WHERE l.status IN ('new', 'contacted')
+       AND (l.next_followup_at IS NULL OR l.next_followup_at <= ?)
+     ORDER BY l.interest_score DESC, l.created_at ASC
+     LIMIT 20`,
+    [nowTs]
+  );
+
+  const queued = [];
+  for (const lead of dueLeads) {
+    const touches = Number(lead.touchpoints || 0);
+    if (touches >= settings.maxTouchpoints) continue;
+
+    const existingPending = get(
+      'SELECT id FROM followup_actions WHERE lead_id = ? AND status = ? LIMIT 1',
+      [lead.id, 'pending']
+    );
+    if (existingPending) continue;
+
+    const payload = {
+      email: lead.email,
+      name: lead.name,
+      source: lead.source,
+      touchpoint: touches + 1,
+      message: `Kurzes Follow-up zu deinem Interesse an unseren digitalen Assets (${lead.source}).`
+    };
+
+    const id = `fup_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    run(
+      'INSERT INTO followup_actions (id, lead_id, channel, action_type, status, payload_json, result_json, created_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        id,
+        lead.id,
+        'email',
+        'nurture',
+        'pending',
+        JSON.stringify(payload),
+        '{}',
+        nowTs,
+        null
+      ]
+    );
+
+    queued.push({ id, leadId: lead.id, email: lead.email });
+  }
+
+  return queued;
+}
+
+async function processFollowupActions(limit = 10) {
+  const rows = all(
+    'SELECT * FROM followup_actions WHERE status = ? ORDER BY created_at ASC LIMIT ?',
+    ['pending', limit]
+  );
+  const processed = [];
+
+  for (const row of rows) {
+    try {
+      const payload = JSON.parse(String(row.payload_json || '{}'));
+      let sent = false;
+
+      if (mailer && payload?.email) {
+        await mailer.sendMail({
+          from: process.env.SMTP_FROM,
+          to: payload.email,
+          subject: 'Kurzes Follow-up von GridOS',
+          text: payload.message || 'Wir melden uns mit einem kurzen Update.',
+          html: `<p>${payload.message || 'Wir melden uns mit einem kurzen Update.'}</p>`
+        });
+        sent = true;
+      }
+
+      run('UPDATE followup_actions SET status = ?, result_json = ?, processed_at = ? WHERE id = ?', [
+        'done',
+        JSON.stringify({ ok: true, sent, ts: Date.now() }),
+        Date.now(),
+        row.id
+      ]);
+
+      const settings = getFollowupSettings();
+      run('UPDATE leads SET status = ?, last_contact_at = ?, next_followup_at = ?, updated_at = ? WHERE id = ?', [
+        'contacted',
+        Date.now(),
+        Date.now() + settings.intervalHours * 60 * 60 * 1000,
+        Date.now(),
+        row.lead_id
+      ]);
+
+      const lead = get('SELECT * FROM leads WHERE id = ?', [row.lead_id]);
+      broadcast('lead:updated', lead);
+      processed.push({ id: row.id, leadId: row.lead_id, sent });
+    } catch (err) {
+      run('UPDATE followup_actions SET status = ?, result_json = ?, processed_at = ? WHERE id = ?', [
+        'failed',
+        JSON.stringify({ ok: false, error: err?.message || 'failed' }),
+        Date.now(),
+        row.id
+      ]);
+    }
+  }
+
+  return processed;
 }
 
 function getBusinessFunnelOverview() {
@@ -718,13 +853,21 @@ function evaluateBusinessAlerts(snapshot) {
   return alerts;
 }
 
-function runEnterpriseIntelligenceCycle() {
+async function runEnterpriseIntelligenceCycle() {
   const snapshot = getBusinessSnapshot();
   const weekly = ensureWeeklyOpsTasks(snapshot);
   const alerts = evaluateBusinessAlerts(snapshot);
   const pricingSettings = getAutopricingSettings();
   const plan = buildCatalogOptimizationPlan(snapshot);
   const appliedPricing = pricingSettings.enabled ? applyCatalogOptimizationPlan(plan) : [];
+  const queuedFollowups = queueFollowupActions(snapshot);
+
+  let processedFollowups = [];
+  try {
+    processedFollowups = await processFollowupActions(10);
+  } catch (err) {
+    console.error('[FollowupCycle] Error:', err);
+  }
 
   if (appliedPricing.length > 0) {
     broadcast('business:pricing', {
@@ -734,12 +877,20 @@ function runEnterpriseIntelligenceCycle() {
     });
   }
 
-  if (weekly.created > 0 || alerts.length > 0 || appliedPricing.length > 0) {
+  if (
+    weekly.created > 0 ||
+    alerts.length > 0 ||
+    appliedPricing.length > 0 ||
+    queuedFollowups.length > 0 ||
+    processedFollowups.length > 0
+  ) {
     broadcast('business:cycle', {
       ts: Date.now(),
       weeklyTasksCreated: weekly.created,
       alertsCreated: alerts.length,
-      pricingApplied: appliedPricing.length
+      pricingApplied: appliedPricing.length,
+      followupsQueued: queuedFollowups.length,
+      followupsProcessed: processedFollowups.length
     });
   }
   return {
@@ -747,7 +898,9 @@ function runEnterpriseIntelligenceCycle() {
     weeklyTasksCreated: weekly.created,
     alertsCreated: alerts.length,
     pricingPlanCount: plan.length,
-    pricingApplied: appliedPricing.length
+    pricingApplied: appliedPricing.length,
+    followupsQueued: queuedFollowups.length,
+    followupsProcessed: processedFollowups.length
   };
 }
 
@@ -1228,7 +1381,7 @@ async function processWebhookJobs() {
 setInterval(processWebhookJobs, 5000);
 setInterval(() => {
   try {
-    runEnterpriseIntelligenceCycle();
+    void runEnterpriseIntelligenceCycle();
   } catch (err) {
     console.error('[EnterpriseCycle] Error:', err);
   }
@@ -1236,7 +1389,7 @@ setInterval(() => {
 
 setTimeout(() => {
   try {
-    runEnterpriseIntelligenceCycle();
+    void runEnterpriseIntelligenceCycle();
   } catch (err) {
     console.error('[EnterpriseCycle:init] Error:', err);
   }
@@ -1894,6 +2047,110 @@ app.post('/api/business/autopricing/apply', async () => {
   return { applied, count: applied.length };
 });
 
+app.get('/api/business/pricing/actions', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 30);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 30;
+  return all('SELECT * FROM pricing_actions ORDER BY created_at DESC LIMIT ?', [limit]);
+});
+
+app.get('/api/business/followups/settings', async () => getFollowupSettings());
+
+app.put('/api/business/followups/settings', async (req) => {
+  const current = getFollowupSettings();
+  const { enabled, intervalHours, maxTouchpoints } = req.body ?? {};
+
+  const next = {
+    enabled: typeof enabled === 'boolean' ? enabled : current.enabled,
+    intervalHours: Number.isFinite(Number(intervalHours)) ? Number(intervalHours) : current.intervalHours,
+    maxTouchpoints: Number.isFinite(Number(maxTouchpoints)) ? Number(maxTouchpoints) : current.maxTouchpoints
+  };
+
+  const upsert = (key, value) => {
+    const existing = get('SELECT value FROM global_settings WHERE key = ?', [key]);
+    if (existing) run('UPDATE global_settings SET value = ? WHERE key = ?', [String(value), key]);
+    else run('INSERT INTO global_settings (key, value) VALUES (?, ?)', [key, String(value)]);
+  };
+
+  upsert('followup_enabled', next.enabled ? 1 : 0);
+  upsert('followup_interval_hours', next.intervalHours);
+  upsert('followup_max_touchpoints', next.maxTouchpoints);
+
+  return getFollowupSettings();
+});
+
+app.get('/api/business/leads', async () => all('SELECT * FROM leads ORDER BY updated_at DESC, created_at DESC LIMIT 200'));
+
+app.post('/api/business/leads', async (req, reply) => {
+  const { email, name = '', source = 'manual', interestScore = 0, notes = '' } = req.body ?? {};
+  if (!email) return reply.code(400).send({ error: 'email required' });
+
+  const existing = get('SELECT * FROM leads WHERE email = ? LIMIT 1', [String(email).toLowerCase()]);
+  if (existing) {
+    run('UPDATE leads SET name = ?, source = ?, interest_score = ?, notes = ?, updated_at = ? WHERE id = ?', [
+      String(name || existing.name),
+      String(source || existing.source),
+      Number(interestScore || existing.interest_score || 0),
+      String(notes || existing.notes || ''),
+      Date.now(),
+      existing.id
+    ]);
+    return get('SELECT * FROM leads WHERE id = ?', [existing.id]);
+  }
+
+  const id = `lead_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  run(
+    'INSERT INTO leads (id, email, name, source, status, interest_score, notes, last_contact_at, next_followup_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      id,
+      String(email).toLowerCase(),
+      String(name || ''),
+      String(source || 'manual'),
+      'new',
+      Number(interestScore || 0),
+      String(notes || ''),
+      null,
+      Date.now(),
+      Date.now(),
+      Date.now()
+    ]
+  );
+  const row = get('SELECT * FROM leads WHERE id = ?', [id]);
+  broadcast('lead:created', row);
+  return row;
+});
+
+app.patch('/api/business/leads/:id', async (req, reply) => {
+  const { id } = req.params;
+  const existing = get('SELECT * FROM leads WHERE id = ? LIMIT 1', [id]);
+  if (!existing) return reply.code(404).send({ error: 'lead not found' });
+
+  const { status, interestScore, notes, nextFollowupAt } = req.body ?? {};
+  run('UPDATE leads SET status = ?, interest_score = ?, notes = ?, next_followup_at = ?, updated_at = ? WHERE id = ?', [
+    String(status || existing.status),
+    Number.isFinite(Number(interestScore)) ? Number(interestScore) : Number(existing.interest_score || 0),
+    String(notes ?? existing.notes ?? ''),
+    Number.isFinite(Number(nextFollowupAt)) ? Number(nextFollowupAt) : existing.next_followup_at,
+    Date.now(),
+    id
+  ]);
+  const row = get('SELECT * FROM leads WHERE id = ?', [id]);
+  broadcast('lead:updated', row);
+  return row;
+});
+
+app.get('/api/business/followups', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 100);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(300, limitRaw)) : 100;
+  return all('SELECT * FROM followup_actions ORDER BY created_at DESC LIMIT ?', [limit]);
+});
+
+app.post('/api/business/followups/run', async () => {
+  const snapshot = getBusinessSnapshot();
+  const queued = queueFollowupActions(snapshot);
+  const processed = await processFollowupActions(20);
+  return { queued: queued.length, processed: processed.length };
+});
+
 app.get('/api/business/alerts', async (req) => {
   const limitRaw = Number(req.query?.limit ?? 30);
   const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, limitRaw)) : 30;
@@ -1901,7 +2158,7 @@ app.get('/api/business/alerts', async (req) => {
 });
 
 app.post('/api/business/alerts/evaluate', async () => {
-  const result = runEnterpriseIntelligenceCycle();
+  const result = await runEnterpriseIntelligenceCycle();
   return result;
 });
 

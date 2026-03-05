@@ -214,6 +214,41 @@ export function migrate() {
       acknowledged INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS leads (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      name TEXT NOT NULL,
+      source TEXT NOT NULL,
+      status TEXT NOT NULL,
+      interest_score REAL NOT NULL DEFAULT 0,
+      notes TEXT NOT NULL,
+      last_contact_at INTEGER,
+      next_followup_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS followup_actions (
+      id TEXT PRIMARY KEY,
+      lead_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      processed_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS pricing_actions (
+      id TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      previous_price REAL NOT NULL,
+      new_price REAL NOT NULL,
+      reason TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
   `);
 
   const ensureColumn = (table, column, def) => {
@@ -429,7 +464,10 @@ export function seedIfEmpty() {
     ['auto_pricing_enabled', '0'],
     ['auto_pricing_max_step_pct', '0.10'],
     ['auto_pricing_min_price_floor', '5'],
-    ['conversion_target', '0.03']
+    ['conversion_target', '0.03'],
+    ['followup_enabled', '1'],
+    ['followup_interval_hours', '48'],
+    ['followup_max_touchpoints', '5']
   ];
 
   for (const [key, value] of defaults) {

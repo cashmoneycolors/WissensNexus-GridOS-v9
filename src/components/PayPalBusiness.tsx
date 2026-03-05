@@ -73,6 +73,85 @@ type Delivery = {
   created_at: number;
 };
 
+type ExecutiveRole = {
+  role: 'CEO' | 'CFO' | 'COO';
+  directive: string;
+};
+
+type BusinessAlert = {
+  id: string;
+  kind: string;
+  severity: string;
+  title: string;
+  message: string;
+  acknowledged: number;
+  created_at: number;
+};
+
+type FunnelOverview = {
+  window: string;
+  productsCreated: number;
+  orders: number;
+  revenue: number;
+  conversion: number;
+  aov: number;
+  conversionTarget: number;
+  byCategory: Array<{
+    category: string;
+    listedPrice: number;
+    currency: string;
+    productsCreated: number;
+    orders: number;
+    revenue: number;
+    conversion: number;
+    aov: number;
+  }>;
+};
+
+type AutoPricingSettings = {
+  enabled: boolean;
+  maxStepPct: number;
+  minPriceFloor: number;
+  conversionTarget: number;
+};
+
+type PricingAction = {
+  id: string;
+  category: string;
+  previous_price: number;
+  new_price: number;
+  reason: string;
+  created_at: number;
+};
+
+type Lead = {
+  id: string;
+  email: string;
+  name: string;
+  source: string;
+  status: string;
+  interest_score: number;
+  notes: string;
+  next_followup_at: number | null;
+  updated_at: number;
+};
+
+type FollowupAction = {
+  id: string;
+  lead_id: string;
+  channel: string;
+  action_type: string;
+  status: string;
+  created_at: number;
+  processed_at: number | null;
+};
+
+type FollowupSettings = {
+  enabled: boolean;
+  intervalHours: number;
+  maxTouchpoints: number;
+};
+
 export default function PayPalBusiness() {
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [transactions, setTransactions] = useState<Tx[]>([]);
@@ -86,12 +165,42 @@ export default function PayPalBusiness() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [deliveries, setDeliveries] = useState<Delivery[]>([]);
   const [modeSaving, setModeSaving] = useState(false);
+  const [executive, setExecutive] = useState<ExecutiveRole>({ role: 'CEO', directive: '' });
+  const [funnel, setFunnel] = useState<FunnelOverview | null>(null);
+  const [alerts, setAlerts] = useState<BusinessAlert[]>([]);
+  const [autoPricing, setAutoPricing] = useState<AutoPricingSettings>({ enabled: false, maxStepPct: 0.1, minPriceFloor: 5, conversionTarget: 0.03 });
+  const [pricingActions, setPricingActions] = useState<PricingAction[]>([]);
+  const [leads, setLeads] = useState<Lead[]>([]);
+  const [followups, setFollowups] = useState<FollowupAction[]>([]);
+  const [followupSettings, setFollowupSettings] = useState<FollowupSettings>({ enabled: true, intervalHours: 48, maxTouchpoints: 5 });
+  const [leadEmail, setLeadEmail] = useState('');
+  const [leadName, setLeadName] = useState('');
+  const [leadSource, setLeadSource] = useState('manual');
+  const [leadNote, setLeadNote] = useState('');
+  const [opsBusy, setOpsBusy] = useState(false);
 
   const [client, setClient] = useState('');
   const [amount, setAmount] = useState(450);
 
   const loadAll = async () => {
-    const [inv, tx, prod, status, cat, ruleRows, orderRows, deliveryRows] = await Promise.all([
+    const [
+      inv,
+      tx,
+      prod,
+      status,
+      cat,
+      ruleRows,
+      orderRows,
+      deliveryRows,
+      roleRow,
+      funnelRow,
+      alertRows,
+      autopRow,
+      pricingRows,
+      leadRows,
+      followRows,
+      followSettings
+    ] = await Promise.all([
       apiGet<Invoice[]>('/api/invoices'),
       apiGet<Tx[]>('/api/transactions'),
       apiGet<Product[]>('/api/products'),
@@ -99,7 +208,15 @@ export default function PayPalBusiness() {
       apiGet<CatalogItem[]>('/api/catalog'),
       apiGet<RuleItem[]>('/api/rules'),
       apiGet<Order[]>('/api/orders'),
-      apiGet<Delivery[]>('/api/deliveries')
+      apiGet<Delivery[]>('/api/deliveries'),
+      apiGet<ExecutiveRole>('/api/business/role'),
+      apiGet<FunnelOverview>('/api/business/funnel'),
+      apiGet<BusinessAlert[]>('/api/business/alerts?limit=8'),
+      apiGet<AutoPricingSettings>('/api/business/autopricing'),
+      apiGet<PricingAction[]>('/api/business/pricing/actions?limit=8'),
+      apiGet<Lead[]>('/api/business/leads'),
+      apiGet<FollowupAction[]>('/api/business/followups?limit=12'),
+      apiGet<FollowupSettings>('/api/business/followups/settings')
     ]);
     setInvoices(inv);
     setTransactions(tx);
@@ -109,6 +226,14 @@ export default function PayPalBusiness() {
     setRules(ruleRows);
     setOrders(orderRows);
     setDeliveries(deliveryRows);
+    setExecutive(roleRow);
+    setFunnel(funnelRow);
+    setAlerts(Array.isArray(alertRows) ? alertRows : alertRows ? [alertRows] : []);
+    setAutoPricing(autopRow);
+    setPricingActions(Array.isArray(pricingRows) ? pricingRows : pricingRows ? [pricingRows] : []);
+    setLeads(leadRows);
+    setFollowups(Array.isArray(followRows) ? followRows : followRows ? [followRows] : []);
+    setFollowupSettings(followSettings);
   };
 
   useEffect(() => {
@@ -220,6 +345,76 @@ export default function PayPalBusiness() {
     setDownloadUrl(res.downloadUrl);
   };
 
+  const saveRole = async (role: 'CEO' | 'CFO' | 'COO') => {
+    setOpsBusy(true);
+    try {
+      const row = await apiSend<ExecutiveRole>('/api/business/role', 'PUT', { role });
+      setExecutive(row);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const saveAutoPricing = async () => {
+    setOpsBusy(true);
+    try {
+      const row = await apiSend<AutoPricingSettings>('/api/business/autopricing', 'PUT', autoPricing);
+      setAutoPricing(row);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const acknowledgeAlerts = async () => {
+    setOpsBusy(true);
+    try {
+      await apiSend('/api/business/alerts/ack_all', 'POST', {});
+      await loadAll();
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const runFollowupsNow = async () => {
+    setOpsBusy(true);
+    try {
+      await apiSend('/api/business/followups/run', 'POST', {});
+      await loadAll();
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const addLead = async () => {
+    if (!leadEmail.trim()) return;
+    setOpsBusy(true);
+    try {
+      await apiSend<Lead>('/api/business/leads', 'POST', {
+        email: leadEmail.trim(),
+        name: leadName.trim(),
+        source: leadSource,
+        notes: leadNote.trim(),
+        interestScore: 0.6
+      });
+      setLeadEmail('');
+      setLeadName('');
+      setLeadNote('');
+      await loadAll();
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const updateLeadStatus = async (lead: Lead, status: string) => {
+    setOpsBusy(true);
+    try {
+      await apiSend(`/api/business/leads/${lead.id}`, 'PATCH', { status });
+      await loadAll();
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
   return (
     <ViewLayout title="PayPal Business Hub" subtitle="Live Checkout & Download Delivery.">
       <div className="grid gap-3 lg:grid-cols-[1fr,360px] h-full">
@@ -258,6 +453,175 @@ export default function PayPalBusiness() {
               >
                 Simulation
               </Button>
+            </div>
+          </Card>
+
+          <Card className="p-4">
+            <div className="text-sm font-bold text-slate-300 mb-3">Executive Intelligence</div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-xl border border-slate-800/80 bg-slate-950/30 p-3">
+                <div className="text-xs text-slate-400">Rollenprofil</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {(['CEO', 'CFO', 'COO'] as const).map((r) => (
+                    <Button
+                      key={r}
+                      onClick={() => saveRole(r)}
+                      disabled={opsBusy || executive.role === r}
+                      className={executive.role === r ? 'bg-emerald-600' : 'bg-slate-800'}
+                    >
+                      {r}
+                    </Button>
+                  ))}
+                </div>
+                <div className="mt-2 text-xs text-slate-500">{executive.directive}</div>
+              </div>
+
+              <div className="rounded-xl border border-slate-800/80 bg-slate-950/30 p-3">
+                <div className="text-xs text-slate-400">Auto-Pricing Guardrails</div>
+                <label className="mt-2 flex items-center gap-2 text-xs text-slate-200">
+                  <input
+                    type="checkbox"
+                    checked={autoPricing.enabled}
+                    onChange={(e) => setAutoPricing((p) => ({ ...p, enabled: e.target.checked }))}
+                  />
+                  Aktiv
+                </label>
+                <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+                  <input
+                    type="number"
+                    value={autoPricing.maxStepPct}
+                    onChange={(e) => setAutoPricing((p) => ({ ...p, maxStepPct: Number(e.target.value) }))}
+                    aria-label="Max price step"
+                    className="rounded border border-slate-700 bg-black/40 px-2 py-1"
+                  />
+                  <input
+                    type="number"
+                    value={autoPricing.minPriceFloor}
+                    onChange={(e) => setAutoPricing((p) => ({ ...p, minPriceFloor: Number(e.target.value) }))}
+                    aria-label="Min price floor"
+                    className="rounded border border-slate-700 bg-black/40 px-2 py-1"
+                  />
+                  <input
+                    type="number"
+                    value={autoPricing.conversionTarget}
+                    onChange={(e) => setAutoPricing((p) => ({ ...p, conversionTarget: Number(e.target.value) }))}
+                    aria-label="Conversion target"
+                    className="rounded border border-slate-700 bg-black/40 px-2 py-1"
+                  />
+                </div>
+                <Button className="mt-2" onClick={saveAutoPricing} disabled={opsBusy}>Save Guardrails</Button>
+              </div>
+            </div>
+
+            {funnel && (
+              <div className="mt-3 grid gap-2 sm:grid-cols-4">
+                <Badge>Orders {funnel.orders}</Badge>
+                <Badge>Products {funnel.productsCreated}</Badge>
+                <Badge>Conversion {(funnel.conversion * 100).toFixed(2)}%</Badge>
+                <Badge tone={funnel.conversion >= funnel.conversionTarget ? 'good' : 'warn'}>
+                  Target {(funnel.conversionTarget * 100).toFixed(2)}%
+                </Badge>
+              </div>
+            )}
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button onClick={() => apiSend('/api/business/alerts/evaluate', 'POST', {}).then(loadAll)} disabled={opsBusy}>Run Cycle Now</Button>
+              <Button variant="ghost" onClick={acknowledgeAlerts} disabled={opsBusy}>Ack Alerts</Button>
+            </div>
+
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <div className="rounded-xl border border-slate-800/80 bg-slate-950/30 p-3">
+                <div className="text-xs text-slate-400 mb-2">Aktive Alerts</div>
+                <div className="space-y-2 max-h-40 overflow-auto custom-scrollbar pr-1">
+                  {alerts.filter((a) => Number(a.acknowledged) === 0).slice(0, 6).map((a) => (
+                    <div key={a.id} className="text-xs rounded border border-amber-500/20 bg-amber-950/20 px-2 py-1">
+                      <div className="font-semibold">{a.title}</div>
+                      <div className="text-slate-300">{a.message}</div>
+                    </div>
+                  ))}
+                  {alerts.filter((a) => Number(a.acknowledged) === 0).length === 0 && <div className="text-xs text-slate-500">Keine offenen Alerts.</div>}
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-slate-800/80 bg-slate-950/30 p-3">
+                <div className="text-xs text-slate-400 mb-2">Letzte Preis-Aenderungen</div>
+                <div className="space-y-2 max-h-40 overflow-auto custom-scrollbar pr-1">
+                  {pricingActions.slice(0, 6).map((p) => (
+                    <div key={p.id} className="text-xs rounded border border-slate-700 bg-black/30 px-2 py-1">
+                      <div className="font-semibold text-slate-200">{p.category}</div>
+                      <div className="text-slate-400">{Number(p.previous_price).toFixed(2)}{' -> '}{Number(p.new_price).toFixed(2)} CHF</div>
+                    </div>
+                  ))}
+                  {pricingActions.length === 0 && <div className="text-xs text-slate-500">Noch keine Preis-Aenderungen.</div>}
+                </div>
+              </div>
+            </div>
+          </Card>
+
+          <Card className="p-4">
+            <div className="text-sm font-bold text-slate-300 mb-3">Leads & Follow-up Automation</div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <input
+                value={leadEmail}
+                onChange={(e) => setLeadEmail(e.target.value)}
+                placeholder="Lead E-Mail"
+                aria-label="Lead email"
+                className="rounded-xl border border-slate-800/80 bg-black/40 px-3 py-2 text-sm"
+              />
+              <input
+                value={leadName}
+                onChange={(e) => setLeadName(e.target.value)}
+                placeholder="Lead Name"
+                aria-label="Lead name"
+                className="rounded-xl border border-slate-800/80 bg-black/40 px-3 py-2 text-sm"
+              />
+            </div>
+            <div className="mt-2 grid gap-2 sm:grid-cols-[1fr,1fr,auto]">
+              <input
+                value={leadSource}
+                onChange={(e) => setLeadSource(e.target.value)}
+                placeholder="Quelle"
+                aria-label="Lead source"
+                className="rounded-xl border border-slate-800/80 bg-black/40 px-3 py-2 text-sm"
+              />
+              <input
+                value={leadNote}
+                onChange={(e) => setLeadNote(e.target.value)}
+                placeholder="Notiz"
+                aria-label="Lead note"
+                className="rounded-xl border border-slate-800/80 bg-black/40 px-3 py-2 text-sm"
+              />
+              <Button onClick={addLead} disabled={opsBusy}>Add Lead</Button>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+              <span>Follow-up: {followupSettings.enabled ? 'aktiv' : 'aus'}</span>
+              <span>Intervall: {followupSettings.intervalHours}h</span>
+              <span>Max Touchpoints: {followupSettings.maxTouchpoints}</span>
+              <Button className="ml-auto" onClick={runFollowupsNow} disabled={opsBusy}>Run Followups</Button>
+            </div>
+
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <div className="space-y-2 max-h-52 overflow-auto custom-scrollbar pr-1">
+                {leads.slice(0, 8).map((l) => (
+                  <div key={l.id} className="rounded-xl border border-slate-800/80 bg-slate-950/30 px-3 py-2 text-xs">
+                    <div className="font-semibold text-slate-100">{l.email}</div>
+                    <div className="text-slate-500">{l.source} · {l.status}</div>
+                    <div className="mt-1 flex gap-2">
+                      <Button className="text-xs" onClick={() => updateLeadStatus(l, 'contacted')} disabled={opsBusy}>Contacted</Button>
+                      <Button variant="ghost" className="text-xs" onClick={() => updateLeadStatus(l, 'won')} disabled={opsBusy}>Won</Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="space-y-2 max-h-52 overflow-auto custom-scrollbar pr-1">
+                {followups.slice(0, 8).map((f) => (
+                  <div key={f.id} className="rounded-xl border border-slate-800/80 bg-slate-950/30 px-3 py-2 text-xs">
+                    <div className="font-semibold text-slate-100">{f.action_type}</div>
+                    <div className="text-slate-500">{f.channel} · {f.status}</div>
+                  </div>
+                ))}
+              </div>
             </div>
           </Card>
 

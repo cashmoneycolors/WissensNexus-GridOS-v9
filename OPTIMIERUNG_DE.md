@@ -208,6 +208,32 @@ Nutzen:
 - Funnel-Leistung wird kontinuierlich beobachtet
 - Autonomes Nachsteuern fuer bessere Abschlussquote und Umsatzqualitaet
 
+## 13) Stufe 4: Angebotsrotation + Sales-Followup + Executive Cockpit
+
+Datei: `server/index.mjs`, `server/db.mjs`, `src/components/PayPalBusiness.tsx`
+
+Umgesetzt:
+
+- KPI-gestuetzte Angebotsrotation
+  - Pricing-Plan wird aus Funnel-Signalen abgeleitet
+  - Guardrails verhindern aggressive Preisstuerze
+  - Audit-Log jeder Preisanpassung in `pricing_actions`
+- Sales-Followup-Automation
+  - Leads-Pipeline mit Status und Followup-Zeitpunkten
+  - Queue + Verarbeitung in `followup_actions`
+  - Optionaler E-Mail-Versand, falls SMTP vorhanden
+  - APIs fuer Leads, Followup-Settings und manuelles Triggern
+- Executive Cockpit im Frontend (PayPal Business)
+  - Rollensteuerung CEO/CFO/COO
+  - Alerts, Funnel-KPIs, Pricing-Aktionen
+  - Lead-Anlage und Followup-Trigger in der UI
+
+Nutzen:
+
+- Mehr operative Steuerbarkeit auf einer zentralen Business-Seite
+- Nachvollziehbare, datenbasierte Preis- und Sales-Entscheidungen
+- Hoher Automatisierungsgrad ohne Kontrollverlust
+
 ## Bekannte Folgeaenderung
 Datei: `server/data.sqlite`
 
