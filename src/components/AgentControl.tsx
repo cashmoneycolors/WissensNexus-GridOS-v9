@@ -10,12 +10,31 @@ type Settings = {
   auto_fix: number;
 };
 
+type AutonomyStatus = {
+  active: boolean;
+  intervalSeconds: number;
+  modelReady: boolean;
+};
+
 export default function AgentControl() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [saving, setSaving] = useState(false);
+  const [autonomyOn, setAutonomyOn] = useState(false);
+  const [autonomyBusy, setAutonomyBusy] = useState(false);
+  const [autonomyInfo, setAutonomyInfo] = useState<AutonomyStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     apiGet<Settings>('/api/agent/settings').then(setSettings).catch(() => setSettings(null));
+    apiGet<AutonomyStatus>('/api/agent/autonomy_status')
+      .then((status) => {
+        setAutonomyOn(status.active);
+        setAutonomyInfo(status);
+      })
+      .catch(() => {
+        setAutonomyOn(false);
+        setAutonomyInfo(null);
+      });
   }, []);
 
   const update = async (patch: Partial<Settings>) => {
@@ -33,10 +52,27 @@ export default function AgentControl() {
     }
   };
 
-  const [autonomyOn, setAutonomyOn] = useState(false);
   const toggleAutonomy = async () => {
-    const res = await apiSend<{status: string}>('/api/agent/toggle_autonomy', 'POST');
-    setAutonomyOn(res.status === 'Startet');
+    if (autonomyBusy) return;
+    setAutonomyBusy(true);
+    try {
+      const res = await apiSend<{ status: string }>('/api/agent/toggle_autonomy', 'POST', undefined, {
+        timeoutMs: 15000,
+        retries: 1
+      });
+      setAutonomyOn(res.status === 'Startet');
+      setError(null);
+
+      const status = await apiGet<AutonomyStatus>('/api/agent/autonomy_status', {
+        timeoutMs: 10000,
+        retries: 1
+      });
+      setAutonomyInfo(status);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Autonomie konnte nicht umgeschaltet werden.');
+    } finally {
+      setAutonomyBusy(false);
+    }
   };
 
   return (
@@ -48,8 +84,16 @@ export default function AgentControl() {
            im Order <code>output_content/</code>. <br/>
            (Verbraucht echte API-Credits!)
          </p>
-         <Button onClick={toggleAutonomy} variant={autonomyOn ? 'soft' : 'solid'} className={autonomyOn ? 'border-red-500 text-red-300' : ''}>
-           {autonomyOn ? 'STOP AUTONOMY' : 'START AUTONOMOUS WORKER'}
+         <div className="flex flex-wrap items-center gap-2">
+          <Badge tone={autonomyOn ? 'good' : 'warn'}>{autonomyOn ? 'Autonomy aktiv' : 'Autonomy aus'}</Badge>
+          <Badge tone={autonomyInfo?.modelReady ? 'good' : 'bad'}>
+            {autonomyInfo?.modelReady ? 'Model bereit' : 'Model fehlt'}
+          </Badge>
+          <Badge>Intervall {autonomyInfo?.intervalSeconds ?? 15}s</Badge>
+         </div>
+         {error && <div className="text-xs text-rose-300">{error}</div>}
+         <Button onClick={toggleAutonomy} disabled={autonomyBusy} variant={autonomyOn ? 'soft' : 'solid'} className={autonomyOn ? 'border-red-500 text-red-300' : ''}>
+           {autonomyBusy ? 'Umschalten...' : autonomyOn ? 'STOP AUTONOMY' : 'START AUTONOMOUS WORKER'}
          </Button>
       </Card>
 

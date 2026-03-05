@@ -80,7 +80,7 @@ const AppGridOS: React.FC = () => {
   // 3) Metrics update (real API)
   const refreshMetrics = useCallback(async () => {
     try {
-      const m = await apiGet<SystemMetrics>('/api/metrics');
+      const m = await apiGet<SystemMetrics>('/api/metrics', { timeoutMs: 9000, retries: 1 });
       setMetrics(m);
     } catch {
       // keep previous metrics if backend is down
@@ -90,8 +90,19 @@ const AppGridOS: React.FC = () => {
   useEffect(() => {
     if (!isBooted) return;
     refreshMetrics();
-    const i = setInterval(refreshMetrics, 5000);
-    return () => clearInterval(i);
+    const i = setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshMetrics();
+    }, 6000);
+
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void refreshMetrics();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
+    return () => {
+      clearInterval(i);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [isBooted, refreshMetrics]);
 
   // 4) View

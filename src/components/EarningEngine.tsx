@@ -17,26 +17,60 @@ export default function EarningEngine() {
   const [note, setNote] = useState('');
   const [amount, setAmount] = useState(120);
   const [type, setType] = useState<'income' | 'expense'>('income');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const totals = useMemo(() => {
-    const income = tx.filter((t) => t.type === 'income').reduce((s, t) => s + t.amount, 0);
-    const expense = tx.filter((t) => t.type === 'expense').reduce((s, t) => s + t.amount, 0);
+    let income = 0;
+    let expense = 0;
+    for (const item of tx) {
+      if (item.type === 'income') income += item.amount;
+      else expense += item.amount;
+    }
     return { income, expense, balance: income - expense };
   }, [tx]);
 
+  const loadTransactions = () => {
+    apiGet<Tx[]>('/api/transactions', { timeoutMs: 10000, retries: 1 })
+      .then((rows) => {
+        setTx(rows);
+        setError(null);
+      })
+      .catch(() => setError('Transaktionen konnten nicht geladen werden.'));
+  };
+
   useEffect(() => {
-    apiGet<Tx[]>('/api/transactions').then(setTx).catch(() => setTx([]));
+    loadTransactions();
   }, []);
 
   const addTx = async () => {
-    const row = await apiSend<Tx>('/api/transactions', 'POST', {
-      type,
-      amount,
-      currency: 'CHF',
-      note: note || 'Manual entry'
-    });
-    setTx((prev) => [row, ...prev]);
-    setNote('');
+    if (saving) return;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setError('Betrag muss groesser als 0 sein.');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const row = await apiSend<Tx>(
+        '/api/transactions',
+        'POST',
+        {
+          type,
+          amount,
+          currency: 'CHF',
+          note: note || 'Manual entry'
+        },
+        { timeoutMs: 12000, retries: 1 }
+      );
+      setTx((prev) => [row, ...prev]);
+      setNote('');
+      setError(null);
+    } catch {
+      setError('Transaktion konnte nicht gespeichert werden.');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -52,6 +86,7 @@ export default function EarningEngine() {
             <Badge tone="warn">Expense {totals.expense.toFixed(2)} CHF</Badge>
           </div>
           <div className="mt-4 space-y-2">
+            {error && <div className="text-xs text-rose-300">{error}</div>}
             {tx.slice(0, 20).map((t) => (
               <div
                 key={t.id}
@@ -94,7 +129,7 @@ export default function EarningEngine() {
               placeholder="Notiz"
               className="w-full rounded-xl border border-slate-800/80 bg-black/40 px-3 py-2 text-sm"
             />
-            <Button onClick={addTx}>Add Transaction</Button>
+            <Button onClick={addTx} disabled={saving}>Add Transaction</Button>
           </div>
         </Card>
       </div>

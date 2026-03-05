@@ -25,13 +25,13 @@
     "@paypal/checkout-server-sdk": "^1.0.3",
     "dotenv": "^17.3.1",
     "fastify": "^4.29.1",
-    "fastify-raw-body": "^5.0.0",
+    "fastify-raw-body": "^4.3.0",
     "nodemailer": "^6.9.16",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^2.15.0",
-    "stripe": "^16.0.0",
-    "sql.js": "^1.10.3"
+    "sql.js": "^1.10.3",
+    "stripe": "^16.0.0"
   },
   "devDependencies": {
     "@electron-forge/cli": "^7.6.0",

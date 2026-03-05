@@ -9,6 +9,21 @@ const child = spawn(process.execPath, ['server/index.mjs'], {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+async function stopChildProcess(proc) {
+  if (proc.exitCode !== null || proc.killed) return;
+
+  proc.kill('SIGTERM');
+  const exited = await Promise.race([
+    once(proc, 'exit').then(() => true),
+    sleep(1500).then(() => false)
+  ]);
+
+  if (!exited && proc.exitCode === null && !proc.killed) {
+    proc.kill('SIGKILL');
+    await once(proc, 'exit');
+  }
+}
+
 async function waitForHealthy({ url, timeoutMs = 30000, intervalMs = 500 }) {
   const started = Date.now();
   let lastError;
@@ -37,12 +52,7 @@ async function run() {
     assert.ok(Array.isArray(data));
     assert.ok(data.length >= 1);
   } finally {
-    if (child.exitCode === null && !child.killed) {
-      child.kill();
-    }
-    if (child.exitCode === null) {
-      await once(child, 'exit');
-    }
+    await stopChildProcess(child);
   }
 }
 
@@ -54,7 +64,5 @@ async function main() {
     process.exitCode = 1;
   }
 }
-
-main();
 
 main();

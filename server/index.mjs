@@ -408,6 +408,102 @@ const JOB_MAX_ATTEMPTS = 5;
 const JOB_BASE_DELAY_MS = 5000;
 const DOWNLOAD_TTL_MS = 1000 * 60 * 60 * 24;
 
+function evaluateArithmeticExpression(input) {
+  const source = String(input || '').trim();
+  if (!source) throw new Error('empty expression');
+
+  const normalized = source.replace(/\s+/g, '');
+  if (!/^[0-9+\-*/().]+$/.test(normalized)) {
+    throw new Error('invalid characters');
+  }
+
+  const tokens = [];
+  let i = 0;
+  while (i < normalized.length) {
+    const ch = normalized[i];
+    if (/[0-9.]/.test(ch)) {
+      let j = i + 1;
+      while (j < normalized.length && /[0-9.]/.test(normalized[j])) j += 1;
+      const raw = normalized.slice(i, j);
+      if ((raw.match(/\./g) || []).length > 1) throw new Error('invalid number');
+      tokens.push(raw);
+      i = j;
+      continue;
+    }
+    tokens.push(ch);
+    i += 1;
+  }
+
+  const out = [];
+  const ops = [];
+  const precedence = { '+': 1, '-': 1, '*': 2, '/': 2 };
+
+  for (let idx = 0; idx < tokens.length; idx += 1) {
+    const token = tokens[idx];
+    const prev = tokens[idx - 1];
+
+    if (/^[0-9.]+$/.test(token)) {
+      out.push(token);
+      continue;
+    }
+
+    if (token === '(') {
+      ops.push(token);
+      continue;
+    }
+
+    if (token === ')') {
+      while (ops.length && ops[ops.length - 1] !== '(') out.push(ops.pop());
+      if (!ops.length) throw new Error('unbalanced parentheses');
+      ops.pop();
+      continue;
+    }
+
+    if (!(token in precedence)) throw new Error('invalid operator');
+
+    const unary = token === '-' && (!prev || prev === '(' || prev in precedence);
+    if (unary) out.push('0');
+
+    while (
+      ops.length &&
+      ops[ops.length - 1] in precedence &&
+      precedence[ops[ops.length - 1]] >= precedence[token]
+    ) {
+      out.push(ops.pop());
+    }
+    ops.push(token);
+  }
+
+  while (ops.length) {
+    const op = ops.pop();
+    if (op === '(' || op === ')') throw new Error('unbalanced parentheses');
+    out.push(op);
+  }
+
+  const stack = [];
+  for (const token of out) {
+    if (/^[0-9.]+$/.test(token)) {
+      stack.push(Number(token));
+      continue;
+    }
+
+    const b = stack.pop();
+    const a = stack.pop();
+    if (!Number.isFinite(a) || !Number.isFinite(b)) throw new Error('invalid syntax');
+
+    if (token === '+') stack.push(a + b);
+    if (token === '-') stack.push(a - b);
+    if (token === '*') stack.push(a * b);
+    if (token === '/') {
+      if (b === 0) throw new Error('division by zero');
+      stack.push(a / b);
+    }
+  }
+
+  if (stack.length !== 1 || !Number.isFinite(stack[0])) throw new Error('invalid expression');
+  return Number(stack[0].toFixed(10));
+}
+
 function getCategoryPricing(category, fallbackPrice, fallbackCurrency) {
   const row = get('SELECT * FROM product_catalog WHERE category = ?', [category]);
   if (!row) return { price: fallbackPrice, currency: fallbackCurrency, enabled: true };
@@ -627,6 +723,10 @@ app.get('/api/health', async () => ({ ok: true, ts: Date.now() }));
 
 // --- AUTONOMY CONTROL ---
 app.post('/api/agent/toggle_autonomy', async (req, reply) => {
+  if (!autonomyActive && !genAI) {
+    return reply.code(503).send({ error: 'Gemini API Key fehlt. Autonomie kann nicht starten.' });
+  }
+
   autonomyActive = !autonomyActive;
   if (autonomyActive) {
     if (!autonomyInterval) autonomyInterval = setInterval(runWorkerCycle, WORKER_INTERVAL_MS); // Check every 15s
@@ -637,6 +737,12 @@ app.post('/api/agent/toggle_autonomy', async (req, reply) => {
     return { status: 'Gestoppt' };
   }
 });
+
+app.get('/api/agent/autonomy_status', async () => ({
+  active: autonomyActive,
+  intervalSeconds: Math.round(WORKER_INTERVAL_MS / 1000),
+  modelReady: Boolean(genAI)
+}));
 // ------------------------
 
 // --- REAL PRODUCTS & CHECKOUT ---
@@ -977,11 +1083,8 @@ ${context}`
       } else if (line.includes('>> CALC:')) {
         const [_, expr] = line.split('>> CALC:');
         try {
-          // Security: Nur erlaubte Zeichen (Zahlen, Operatoren)
-          const safeExpr = expr.replace(/[^0-9+\-*/().\s]/g, ''); 
-          if (!safeExpr.trim()) throw new Error("Empty Expression");
-          const res = new Function('return ' + safeExpr)();
-          finalLines.push(`🧮 *Mathematix:* ${safeExpr.trim()} = **${res}**`);
+          const resultValue = evaluateArithmeticExpression(expr);
+          finalLines.push(`🧮 *Mathematix:* ${String(expr).trim()} = **${resultValue}**`);
         } catch (e) {
           finalLines.push(`⚠️ *Calc Error:* ${expr}`);
         }

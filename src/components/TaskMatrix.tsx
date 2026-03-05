@@ -14,11 +14,24 @@ type Task = {
 export default function TaskMatrix() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [title, setTitle] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const load = () => apiGet<Task[]>('/api/tasks').then(setTasks).catch(() => setTasks([]));
+    const load = () =>
+      apiGet<Task[]>('/api/tasks', { timeoutMs: 10000, retries: 1 })
+        .then((rows) => {
+          setTasks(rows);
+          setError(null);
+        })
+        .catch(() => {
+          setError('Aufgaben konnten nicht geladen werden.');
+        });
+
     load();
-    const i = setInterval(load, 3000); // Poll for updates
+    const i = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, 5000);
     return () => clearInterval(i);
   }, []);
 
@@ -26,21 +39,52 @@ export default function TaskMatrix() {
 
   const addTask = async () => {
     if (!title.trim()) return;
-    const row = await apiSend<Task>('/api/tasks', 'POST', { title, priority: 2 });
-    setTasks((prev) => [row, ...prev]);
-    setTitle('');
+    if (busy) return;
+    setBusy(true);
+    try {
+      const row = await apiSend<Task>(
+        '/api/tasks',
+        'POST',
+        { title, priority: 2 },
+        { timeoutMs: 12000, retries: 1 }
+      );
+      setTasks((prev) => [row, ...prev]);
+      setTitle('');
+      setError(null);
+    } catch {
+      setError('Task konnte nicht erstellt werden.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const toggle = async (t: Task) => {
     const newDone = t.done ? 0 : 1;
-    await apiSend(`/api/tasks/${t.id}`, 'PATCH', { done: newDone });
-    setTasks((prev) => prev.map((x) => (x.id === t.id ? { ...x, done: newDone } : x)));
+    if (busy) return;
+    setBusy(true);
+    try {
+      await apiSend(`/api/tasks/${t.id}`, 'PATCH', { done: newDone }, { timeoutMs: 12000, retries: 1 });
+      setTasks((prev) => prev.map((x) => (x.id === t.id ? { ...x, done: newDone } : x)));
+      setError(null);
+    } catch {
+      setError('Task-Status konnte nicht aktualisiert werden.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const remove = async (t: Task) => {
-    await apiSend(`/api/tasks/${t.id}`, 'DELETE');
-    const newTasks = tasks.filter((x) => x.id !== t.id);
-    setTasks(newTasks);
+    if (busy) return;
+    setBusy(true);
+    try {
+      await apiSend(`/api/tasks/${t.id}`, 'DELETE', undefined, { timeoutMs: 12000, retries: 1 });
+      setTasks((prev) => prev.filter((x) => x.id !== t.id));
+      setError(null);
+    } catch {
+      setError('Task konnte nicht gelöscht werden.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -57,8 +101,10 @@ export default function TaskMatrix() {
             placeholder="Neue Task"
             className="flex-1 rounded-xl border border-slate-800/80 bg-black/40 px-3 py-2 text-sm"
           />
-          <Button onClick={addTask}>Add</Button>
+          <Button onClick={addTask} disabled={busy}>Add</Button>
         </div>
+
+        {error && <div className="mt-2 text-xs text-rose-300">{error}</div>}
 
         <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
           {tasks.slice(0, 30).map((t) => (
@@ -74,6 +120,7 @@ export default function TaskMatrix() {
               <div className="flex items-center justify-between gap-2">
                 <button
                   onClick={() => toggle(t)}
+                  disabled={busy}
                   className="truncate text-sm font-semibold text-slate-100"
                 >
                   {t.title}
@@ -82,6 +129,7 @@ export default function TaskMatrix() {
                   <Badge tone={t.done ? 'good' : 'neutral'}>{t.done ? 'Done' : 'Open'}</Badge>
                   <button
                     onClick={() => remove(t)}
+                    disabled={busy}
                     className="text-xs text-rose-300 hover:text-rose-200"
                   >
                     Delete

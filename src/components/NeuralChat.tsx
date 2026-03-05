@@ -27,8 +27,10 @@ export default function NeuralChat() {
   ]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
+  const messagesRef = useRef<ChatMsg[]>(messages);
 
   useEffect(() => {
+    messagesRef.current = messages;
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages]);
 
@@ -44,7 +46,7 @@ export default function NeuralChat() {
 
     try {
       // History für Backend vorbereiten
-      const history = messages
+      const history = messagesRef.current
         .filter((m) => m.role !== 'system')
         .map((m) => ({
           role: m.role === 'user' ? 'user' : 'model',
@@ -52,10 +54,15 @@ export default function NeuralChat() {
         }));
 
       // Backend Call
-      const res = await apiSend<{ text: string }>('/api/chat', 'POST', {
-        message: text,
-        history
-      });
+      const res = await apiSend<{ text: string }>(
+        '/api/chat',
+        'POST',
+        {
+          message: text,
+          history
+        },
+        { timeoutMs: 20000, retries: 1 }
+      );
 
       setMessages((prev) => [...prev, { id: uid(), role: 'assistant', text: res.text }]);
       setBackendReady(true);
@@ -73,7 +80,7 @@ export default function NeuralChat() {
     } finally {
       setBusy(false);
     }
-  }, [busy, input, messages]);
+  }, [busy, input]);
 
   return (
     <ViewLayout
