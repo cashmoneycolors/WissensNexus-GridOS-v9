@@ -12,6 +12,7 @@
     "preview": "vite preview --host",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node server/test.mjs",
+    "test:load": "node server/loadtest.mjs",
     "dev:electron": "cross-env NODE_ENV=development electron-vite dev",
     "build:electron": "cross-env NODE_ENV=production electron-vite build",
     "make": "electron-forge make",

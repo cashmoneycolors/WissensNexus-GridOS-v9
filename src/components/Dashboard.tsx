@@ -1,11 +1,29 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import type { SystemMetrics } from '../types';
 import ViewLayout from './ViewLayout';
 import { Badge, Card, Button } from './ui';
-import { apiSend } from '../lib/api';
+import { apiGet, apiSend } from '../lib/api';
 
 type Props = {
   metrics: SystemMetrics;
+};
+
+type TelemetrySummary = {
+  windowMinutes: number;
+  totalRequests: number;
+  avgLatencyMs: number;
+  maxLatencyMs: number;
+  errorRate: number;
+  slowRoutes: Array<{ route: string; method: string; hits: number; avgLatencyMs: number }>;
+};
+
+type WebhookJob = {
+  id: string;
+  provider: string;
+  event_type: string;
+  status: string;
+  attempts: number;
+  updated_at: number;
 };
 
 function formatMoneyCHF(value: number) {
@@ -19,6 +37,26 @@ function formatMoneyCHF(value: number) {
 export default function Dashboard({ metrics }: Props) {
   const [editingBudget, setEditingBudget] = useState(false);
   const [budgetVal, setBudgetVal] = useState(metrics.dailyBudgetCHF.toString());
+  const [telemetry, setTelemetry] = useState<TelemetrySummary | null>(null);
+  const [deadLetter, setDeadLetter] = useState<WebhookJob[]>([]);
+  const [opsBusy, setOpsBusy] = useState(false);
+
+  useEffect(() => {
+    const load = () => {
+      apiGet<TelemetrySummary>('/api/telemetry/summary?windowMinutes=60')
+        .then(setTelemetry)
+        .catch(() => setTelemetry(null));
+      apiGet<WebhookJob[]>('/api/webhooks/dead-letter?limit=5')
+        .then((rows) => setDeadLetter(Array.isArray(rows) ? rows : []))
+        .catch(() => setDeadLetter([]));
+    };
+
+    load();
+    const i = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, 10000);
+    return () => clearInterval(i);
+  }, []);
 
   const saveBudget = async () => {
     const val = parseFloat(budgetVal);
@@ -34,6 +72,30 @@ export default function Dashboard({ metrics }: Props) {
     if (metrics.load < 75) return 'warn' as const;
     return 'bad' as const;
   }, [metrics.load]);
+
+  const replayJob = async (id: string) => {
+    if (!id || opsBusy) return;
+    setOpsBusy(true);
+    try {
+      await apiSend(`/api/webhooks/replay/${id}`, 'POST', {});
+      const rows = await apiGet<WebhookJob[]>('/api/webhooks/dead-letter?limit=5');
+      setDeadLetter(Array.isArray(rows) ? rows : []);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const replayAll = async () => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      await apiSend('/api/webhooks/replay_failed', 'POST', {});
+      const rows = await apiGet<WebhookJob[]>('/api/webhooks/dead-letter?limit=5');
+      setDeadLetter(Array.isArray(rows) ? rows : []);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
 
   return (
     <ViewLayout
@@ -108,6 +170,56 @@ export default function Dashboard({ metrics }: Props) {
               <Badge>Typo via clamp()</Badge>
               <Badge>Lazy Views</Badge>
             </div>
+          </div>
+        </Card>
+
+        <Card className="p-4 sm:col-span-2 lg:col-span-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-semibold text-slate-400">Telemetry (60m)</div>
+            <Badge tone={telemetry && telemetry.errorRate > 0.03 ? 'bad' : 'good'}>
+              Error {(Number(telemetry?.errorRate || 0) * 100).toFixed(2)}%
+            </Badge>
+          </div>
+          <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">Requests</div>
+              <div className="font-bold text-slate-100">{telemetry?.totalRequests ?? 0}</div>
+            </div>
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">Avg</div>
+              <div className="font-bold text-slate-100">{Number(telemetry?.avgLatencyMs || 0).toFixed(1)} ms</div>
+            </div>
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">Max</div>
+              <div className="font-bold text-slate-100">{Number(telemetry?.maxLatencyMs || 0).toFixed(1)} ms</div>
+            </div>
+          </div>
+          <div className="mt-3 text-xs text-slate-400">Top Slow Routes</div>
+          <div className="mt-1 space-y-1 max-h-28 overflow-auto custom-scrollbar">
+            {(telemetry?.slowRoutes || []).slice(0, 5).map((r) => (
+              <div key={`${r.method}_${r.route}`} className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs">
+                <span className="font-semibold text-slate-200">{r.method} {r.route}</span>
+                <span className="ml-2 text-slate-400">{r.avgLatencyMs.toFixed(1)} ms ({r.hits})</span>
+              </div>
+            ))}
+            {(telemetry?.slowRoutes || []).length === 0 && <div className="text-xs text-slate-500">Keine Daten.</div>}
+          </div>
+        </Card>
+
+        <Card className="p-4 sm:col-span-2 lg:col-span-1">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-semibold text-slate-400">Webhook Dead-Letter</div>
+            <Button className="text-xs" onClick={replayAll} disabled={opsBusy || deadLetter.length === 0}>Replay All</Button>
+          </div>
+          <div className="mt-2 space-y-1 max-h-44 overflow-auto custom-scrollbar">
+            {deadLetter.map((j) => (
+              <div key={j.id} className="rounded border border-amber-500/20 bg-amber-950/20 p-2 text-xs">
+                <div className="font-semibold text-slate-100">{j.provider} · {j.event_type}</div>
+                <div className="text-slate-400">Attempts {j.attempts}</div>
+                <Button className="mt-1 text-xs" onClick={() => replayJob(j.id)} disabled={opsBusy}>Replay</Button>
+              </div>
+            ))}
+            {deadLetter.length === 0 && <div className="text-xs text-slate-500">Keine fehlgeschlagenen Jobs.</div>}
           </div>
         </Card>
       </div>

@@ -58,9 +58,23 @@ const mailer = smtpConfigured
 // --- AUTONOMY STATE ---
 let autonomyActive = false;
 let autonomyInterval = null;
+let workerCycleBusy = false;
+let workerCycleRuns = 0;
+let workerCycleSkipped = 0;
+let workerCycleLastDurationMs = 0;
+let workerCycleLastAt = 0;
+
+let webhookProcessorBusy = false;
+let webhookProcessorRuns = 0;
+let webhookProcessorSkipped = 0;
+let webhookProcessorLastDurationMs = 0;
+let webhookProcessorLastAt = 0;
+
 const CONTENT_DIR = path.join(process.cwd(), 'output_content');
 const WORKER_INTERVAL_MS = 15000;
 const ASSETS_PER_CYCLE = 3;
+const WEBHOOK_PROCESS_INTERVAL_MS = Number(process.env.WEBHOOK_PROCESS_INTERVAL_MS || 5000);
+const WEBHOOK_JOB_BATCH_SIZE = Number(process.env.WEBHOOK_JOB_BATCH_SIZE || 5);
 const DEFAULT_CATALOG = [
   { category: 'MICRO_SAAS', price: 49.00, currency: 'CHF' },
   { category: 'SEO_CONTENT', price: 29.00, currency: 'CHF' },
@@ -432,6 +446,24 @@ Create multiple high-quality digital assets when asked. Use one >> FILE line per
     flushFile();
   } catch (e) {
     console.error('[Worker] Error:', e);
+  }
+}
+
+async function runWorkerCycleGuarded() {
+  if (workerCycleBusy) {
+    workerCycleSkipped += 1;
+    return;
+  }
+
+  workerCycleBusy = true;
+  const start = Date.now();
+  try {
+    await runWorkerCycle();
+    workerCycleRuns += 1;
+  } finally {
+    workerCycleLastDurationMs = Date.now() - start;
+    workerCycleLastAt = Date.now();
+    workerCycleBusy = false;
   }
 }
 
@@ -1557,10 +1589,43 @@ async function processStripeSession(session) {
   return { orderId, downloadUrl };
 }
 
+async function processPayPalCaptureWebhook(payload) {
+  if (!paypalClient) return null;
+  const resource = payload?.resource || {};
+  const orderId = resource?.supplementary_data?.related_ids?.order_id;
+  const captureId = String(resource?.id || payload?.id || '');
+  if (!orderId || !captureId) return null;
+
+  const existing = findOrderByProviderRef(captureId);
+  if (existing) return { orderId: existing.id, duplicate: true };
+
+  const request = new paypal.orders.OrdersGetRequest(orderId);
+  const response = await paypalClient.execute(request);
+  const purchaseUnit = response.result.purchase_units?.[0];
+  const productId = purchaseUnit?.custom_id;
+  const product = productId ? get('SELECT * FROM products WHERE id = ?', [productId]) : null;
+  if (!product) return null;
+
+  const recordedOrderId = recordSale({
+    provider: 'paypal',
+    amount: Number(product.price),
+    currency: String(product.currency),
+    productId: product.id,
+    buyerEmail: response.result.payer?.email_address || 'unknown',
+    providerRef: captureId
+  });
+
+  const token = getOrCreateDownloadToken(recordedOrderId, product.file_path);
+  const downloadUrl = `${API_BASE_URL}/api/download/${token}`;
+  await deliverIfPossible(recordedOrderId, response.result.payer?.email_address || 'unknown', product.title, downloadUrl);
+  return { orderId: recordedOrderId, downloadUrl };
+}
+
 async function processWebhookJobs() {
-  const jobs = all('SELECT * FROM webhook_jobs WHERE status = ? AND next_run <= ? ORDER BY created_at ASC LIMIT 5', [
+  const jobs = all('SELECT * FROM webhook_jobs WHERE status = ? AND next_run <= ? ORDER BY created_at ASC LIMIT ?', [
     'pending',
-    Date.now()
+    Date.now(),
+    WEBHOOK_JOB_BATCH_SIZE
   ]);
 
   for (const job of jobs) {
@@ -1569,6 +1634,10 @@ async function processWebhookJobs() {
       if (job.provider === 'stripe') {
         if (job.event_type === 'checkout.session.completed' || job.event_type === 'checkout.session.async_payment_succeeded') {
           await processStripeSession(payload.data?.object || payload.data || payload);
+        }
+      } else if (job.provider === 'paypal') {
+        if (job.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
+          await processPayPalCaptureWebhook(payload);
         }
       }
       markJobDone(job.id);
@@ -1583,7 +1652,27 @@ async function processWebhookJobs() {
   }
 }
 
-setInterval(processWebhookJobs, 5000);
+async function processWebhookJobsGuarded() {
+  if (webhookProcessorBusy) {
+    webhookProcessorSkipped += 1;
+    return;
+  }
+
+  webhookProcessorBusy = true;
+  const start = Date.now();
+  try {
+    await processWebhookJobs();
+    webhookProcessorRuns += 1;
+  } finally {
+    webhookProcessorLastDurationMs = Date.now() - start;
+    webhookProcessorLastAt = Date.now();
+    webhookProcessorBusy = false;
+  }
+}
+
+setInterval(() => {
+  void processWebhookJobsGuarded();
+}, WEBHOOK_PROCESS_INTERVAL_MS);
 setInterval(() => {
   try {
     void runEnterpriseIntelligenceCycle();
@@ -1637,7 +1726,9 @@ app.post('/api/agent/toggle_autonomy', async (req, reply) => {
 
   autonomyActive = !autonomyActive;
   if (autonomyActive) {
-    if (!autonomyInterval) autonomyInterval = setInterval(runWorkerCycle, WORKER_INTERVAL_MS); // Check every 15s
+    if (!autonomyInterval) autonomyInterval = setInterval(() => {
+      void runWorkerCycleGuarded();
+    }, WORKER_INTERVAL_MS);
     return { status: 'Startet', nextRun: `${Math.round(WORKER_INTERVAL_MS / 1000)}s`, hint: 'Check output_content/ folder.' };
   } else {
     if (autonomyInterval) clearInterval(autonomyInterval);
@@ -1649,7 +1740,14 @@ app.post('/api/agent/toggle_autonomy', async (req, reply) => {
 app.get('/api/agent/autonomy_status', async () => ({
   active: autonomyActive,
   intervalSeconds: Math.round(WORKER_INTERVAL_MS / 1000),
-  modelReady: Boolean(genAI)
+  modelReady: Boolean(genAI),
+  worker: {
+    busy: workerCycleBusy,
+    runs: workerCycleRuns,
+    skipped: workerCycleSkipped,
+    lastDurationMs: workerCycleLastDurationMs,
+    lastAt: workerCycleLastAt
+  }
 }));
 // ------------------------
 
@@ -2027,6 +2125,60 @@ app.post('/api/webhooks/paypal', async (req, reply) => {
 
   return { received: true };
 });
+
+app.get('/api/webhooks/dead-letter', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 50);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 50;
+  return all('SELECT * FROM webhook_jobs WHERE status = ? ORDER BY updated_at DESC LIMIT ?', ['failed', limit]);
+});
+
+app.post('/api/webhooks/replay/:id', async (req, reply) => {
+  const { id } = req.params;
+  const row = get('SELECT * FROM webhook_jobs WHERE id = ? LIMIT 1', [id]);
+  if (!row) return reply.code(404).send({ error: 'job not found' });
+
+  run('UPDATE webhook_jobs SET status = ?, attempts = ?, next_run = ?, updated_at = ? WHERE id = ?', [
+    'pending',
+    0,
+    Date.now(),
+    Date.now(),
+    id
+  ]);
+
+  return { ok: true, id };
+});
+
+app.post('/api/webhooks/replay_failed', async () => {
+  const failed = all('SELECT id FROM webhook_jobs WHERE status = ?', ['failed']);
+  run('UPDATE webhook_jobs SET status = ?, attempts = ?, next_run = ?, updated_at = ? WHERE status = ?', [
+    'pending',
+    0,
+    Date.now(),
+    Date.now(),
+    'failed'
+  ]);
+  return { ok: true, count: failed.length };
+});
+
+app.get('/api/ops/backpressure', async () => ({
+  worker: {
+    busy: workerCycleBusy,
+    runs: workerCycleRuns,
+    skipped: workerCycleSkipped,
+    lastDurationMs: workerCycleLastDurationMs,
+    lastAt: workerCycleLastAt,
+    intervalMs: WORKER_INTERVAL_MS
+  },
+  webhookProcessor: {
+    busy: webhookProcessorBusy,
+    runs: webhookProcessorRuns,
+    skipped: webhookProcessorSkipped,
+    lastDurationMs: webhookProcessorLastDurationMs,
+    lastAt: webhookProcessorLastAt,
+    intervalMs: WEBHOOK_PROCESS_INTERVAL_MS,
+    batchSize: WEBHOOK_JOB_BATCH_SIZE
+  }
+}));
 
 app.get('/api/download/:token', async (req, reply) => {
   const { token } = req.params;

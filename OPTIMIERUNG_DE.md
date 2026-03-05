@@ -318,6 +318,33 @@ Nutzen:
 - Messbare API-Qualitaet (Latenz/Fehlerrate) statt Blackbox
 - Robustere Webhook-Verarbeitung gegen Replay/Duplicate/Fehlkonfiguration
 
+## 16) Stufe 7: Frontend Telemetry + Dead-Letter Replay + Worker Lasttest
+
+Datei: `src/components/Dashboard.tsx`, `server/index.mjs`, `server/loadtest.mjs`, `package.json`
+
+Umgesetzt:
+
+- Telemetry-Dashboard im Frontend
+  - KPI-Kacheln fuer Requests, Avg/Max-Latenz, Error-Rate
+  - Top-Slow-Routes direkt im Dashboard
+- Webhook Dead-Letter + Replay Tool
+  - APIs: `GET /api/webhooks/dead-letter`, `POST /api/webhooks/replay/:id`, `POST /api/webhooks/replay_failed`
+  - Replay-Aktionen direkt im Dashboard fuer einzelne oder alle fehlgeschlagenen Jobs
+- Backpressure-Hardening fuer Worker- und Webhook-Prozessor
+  - Guarded execution gegen Ueberlappung (`busy/skipped/runs`)
+  - Runtime-Status API: `GET /api/ops/backpressure`
+  - Erweiterter `autonomy_status` um Worker-Backpressure-Metriken
+- Lasttest fuer Worker-Zyklen
+  - Neues Script: `server/loadtest.mjs`
+  - NPM Command: `npm run test:load`
+  - Liefert Lastprofil (avg/p95/max, Fehlerquote) plus Backpressure-Snapshot
+
+Nutzen:
+
+- Operativer Zustand ist im Frontend live sichtbar und steuerbar
+- Fehlgeschlagene Webhooks koennen gezielt ohne DB-Eingriffe reprocessiert werden
+- Worker- und Queue-Stabilitaet ist unter Last messbar und kontrollierbar
+
 ## Bekannte Folgeaenderung
 
 Datei: `server/data.sqlite`
@@ -333,7 +360,7 @@ Datei: `server/data.sqlite`
 
 ## Nächste Optimierungsstufe (optional)
 
-1. Event-getriebene Live-Updates fuer Tasks/Transactions per WebSocket statt Polling.
-2. Zentrales Logging/Tracing fuer API-Latenzen und Fehlerraten.
+1. Telemetry-Dashboard im Frontend (Live-Latenz, Fehlerrate, Top-Slow-Routes).
+2. Webhook-Dead-Letter-Handling mit Replay-Tool fuer fehlgeschlagene Events.
 3. Lasttest fuer autonome Worker-Zyklen (Queue, Limits, Backpressure).
-4. Security-Hardening fuer Webhooks (Idempotenz + Signatur-Validierung pro Provider-Pfad).
+4. Provider-native Verifikation fuer PayPal-Webhooks (zusaetzlich zur Route-Token-Haertung).
