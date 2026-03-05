@@ -345,6 +345,35 @@ Nutzen:
 - Fehlgeschlagene Webhooks koennen gezielt ohne DB-Eingriffe reprocessiert werden
 - Worker- und Queue-Stabilitaet ist unter Last messbar und kontrollierbar
 
+## 17) Stufe 8: Native PayPal Verify + Replay-Policy + Backpressure Heat Panel
+
+Datei: `server/index.mjs`, `src/components/Dashboard.tsx`
+
+Umgesetzt:
+
+- Provider-native PayPal Webhook Verification
+  - Zusaetzlich zur Token-Haertung wird die native PayPal-Signaturverifikation verwendet
+  - Verify-API: `POST /v1/notifications/verify-webhook-signature`
+  - Erforderliche Konfiguration: `PAYPAL_WEBHOOK_ID`, `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`
+- Dead-Letter Replay mit Filter/Batch/Backoff-Policy
+  - Filter in `GET /api/webhooks/dead-letter`: `provider`, `eventType`, `attemptsMin`, `status`, `limit`
+  - Replay-Strategien (`reset|preserve|backoff`) in:
+    - `POST /api/webhooks/replay/:id`
+    - `POST /api/webhooks/replay_failed`
+  - Replay-Policy APIs:
+    - `GET /api/webhooks/replay_policy`
+    - `PUT /api/webhooks/replay_policy`
+- Frontend Ops/Backpressure Live-Heat-Panel
+  - Live-Auslastung Worker und Webhook-Prozessor als Heat-Bars
+  - Queue-Zustand (`pending`, `failed`) und aktive Replay-Policy sichtbar
+  - Dead-Letter UI mit Provider/Event-Filter, Strategie und Batch-Size
+
+Nutzen:
+
+- Signaturpruefung fuer PayPal ist provider-nativ und belastbarer gegen Spoofing
+- Replay kann gezielt und risikoarm gesteuert werden (statt pauschalem Requeue)
+- Operative Last- und Queue-Zustaende sind sofort im Frontend sichtbar
+
 ## Bekannte Folgeaenderung
 
 Datei: `server/data.sqlite`
@@ -360,7 +389,7 @@ Datei: `server/data.sqlite`
 
 ## Nächste Optimierungsstufe (optional)
 
-1. Telemetry-Dashboard im Frontend (Live-Latenz, Fehlerrate, Top-Slow-Routes).
-2. Webhook-Dead-Letter-Handling mit Replay-Tool fuer fehlgeschlagene Events.
-3. Lasttest fuer autonome Worker-Zyklen (Queue, Limits, Backpressure).
-4. Provider-native Verifikation fuer PayPal-Webhooks (zusaetzlich zur Route-Token-Haertung).
+1. Persistente Ops-Historie fuer Backpressure-Metriken (Trend statt Punktwerte).
+2. Automatische Alert-Regeln bei hoher Queue-Latenz oder steigender Error-Rate.
+3. PayPal-Sandbox/Live-Umschaltung fuer native Verify-API per Runtime-Setting.
+4. Replay-Rate-Limiting pro Provider/Event-Typ fuer noch feinere Lastkontrolle.

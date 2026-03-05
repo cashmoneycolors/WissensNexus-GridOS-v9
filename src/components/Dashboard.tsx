@@ -26,6 +26,33 @@ type WebhookJob = {
   updated_at: number;
 };
 
+type BackpressureSnapshot = {
+  worker: {
+    busy: boolean;
+    runs: number;
+    skipped: number;
+    lastDurationMs: number;
+    lastAt: number;
+    intervalMs: number;
+  };
+  webhookProcessor: {
+    busy: boolean;
+    runs: number;
+    skipped: number;
+    lastDurationMs: number;
+    lastAt: number;
+    intervalMs: number;
+    batchSize: number;
+    pendingJobs: number;
+    failedJobs: number;
+  };
+  replayPolicy: {
+    baseDelayMs: number;
+    maxDelayMs: number;
+    batchSize: number;
+  };
+};
+
 function formatMoneyCHF(value: number) {
   return new Intl.NumberFormat('de-CH', {
     style: 'currency',
@@ -39,24 +66,42 @@ export default function Dashboard({ metrics }: Props) {
   const [budgetVal, setBudgetVal] = useState(metrics.dailyBudgetCHF.toString());
   const [telemetry, setTelemetry] = useState<TelemetrySummary | null>(null);
   const [deadLetter, setDeadLetter] = useState<WebhookJob[]>([]);
+  const [ops, setOps] = useState<BackpressureSnapshot | null>(null);
+  const [providerFilter, setProviderFilter] = useState('');
+  const [eventFilter, setEventFilter] = useState('');
+  const [replayStrategy, setReplayStrategy] = useState<'reset' | 'preserve' | 'backoff'>('backoff');
+  const [replayBatchSize, setReplayBatchSize] = useState(20);
   const [opsBusy, setOpsBusy] = useState(false);
 
   useEffect(() => {
     const load = () => {
+      const params = new URLSearchParams();
+      params.set('limit', '8');
+      if (providerFilter.trim()) params.set('provider', providerFilter.trim());
+      if (eventFilter.trim()) params.set('eventType', eventFilter.trim());
+
       apiGet<TelemetrySummary>('/api/telemetry/summary?windowMinutes=60')
         .then(setTelemetry)
         .catch(() => setTelemetry(null));
-      apiGet<WebhookJob[]>('/api/webhooks/dead-letter?limit=5')
+      apiGet<WebhookJob[]>(`/api/webhooks/dead-letter?${params.toString()}`)
         .then((rows) => setDeadLetter(Array.isArray(rows) ? rows : []))
         .catch(() => setDeadLetter([]));
+      apiGet<BackpressureSnapshot>('/api/ops/backpressure')
+        .then((bp) => {
+          setOps(bp);
+          if (bp?.replayPolicy?.batchSize && !Number.isFinite(replayBatchSize)) {
+            setReplayBatchSize(bp.replayPolicy.batchSize);
+          }
+        })
+        .catch(() => setOps(null));
     };
 
     load();
     const i = setInterval(() => {
       if (document.visibilityState === 'visible') load();
-    }, 10000);
+    }, 5000);
     return () => clearInterval(i);
-  }, []);
+  }, [providerFilter, eventFilter, replayBatchSize]);
 
   const saveBudget = async () => {
     const val = parseFloat(budgetVal);
@@ -77,9 +122,11 @@ export default function Dashboard({ metrics }: Props) {
     if (!id || opsBusy) return;
     setOpsBusy(true);
     try {
-      await apiSend(`/api/webhooks/replay/${id}`, 'POST', {});
-      const rows = await apiGet<WebhookJob[]>('/api/webhooks/dead-letter?limit=5');
+      await apiSend(`/api/webhooks/replay/${id}`, 'POST', { strategy: replayStrategy });
+      const rows = await apiGet<WebhookJob[]>(`/api/webhooks/dead-letter?limit=8&provider=${encodeURIComponent(providerFilter)}&eventType=${encodeURIComponent(eventFilter)}`);
       setDeadLetter(Array.isArray(rows) ? rows : []);
+      const bp = await apiGet<BackpressureSnapshot>('/api/ops/backpressure');
+      setOps(bp);
     } finally {
       setOpsBusy(false);
     }
@@ -89,13 +136,25 @@ export default function Dashboard({ metrics }: Props) {
     if (opsBusy) return;
     setOpsBusy(true);
     try {
-      await apiSend('/api/webhooks/replay_failed', 'POST', {});
-      const rows = await apiGet<WebhookJob[]>('/api/webhooks/dead-letter?limit=5');
+      await apiSend('/api/webhooks/replay_failed', 'POST', {
+        provider: providerFilter || undefined,
+        eventType: eventFilter || undefined,
+        strategy: replayStrategy,
+        batchSize: Number.isFinite(replayBatchSize) ? replayBatchSize : 20
+      });
+      const rows = await apiGet<WebhookJob[]>(`/api/webhooks/dead-letter?limit=8&provider=${encodeURIComponent(providerFilter)}&eventType=${encodeURIComponent(eventFilter)}`);
       setDeadLetter(Array.isArray(rows) ? rows : []);
+      const bp = await apiGet<BackpressureSnapshot>('/api/ops/backpressure');
+      setOps(bp);
     } finally {
       setOpsBusy(false);
     }
   };
+
+  const workerUtil = ops ? Math.min(100, Math.round((Number(ops.worker.lastDurationMs || 0) / Math.max(1, Number(ops.worker.intervalMs || 1))) * 100)) : 0;
+  const webhookUtil = ops ? Math.min(100, Math.round((Number(ops.webhookProcessor.lastDurationMs || 0) / Math.max(1, Number(ops.webhookProcessor.intervalMs || 1))) * 100)) : 0;
+
+  const heatTone = (v: number) => (v >= 80 ? 'bg-rose-500' : v >= 50 ? 'bg-amber-500' : 'bg-emerald-500');
 
   return (
     <ViewLayout
@@ -211,6 +270,41 @@ export default function Dashboard({ metrics }: Props) {
             <div className="text-xs font-semibold text-slate-400">Webhook Dead-Letter</div>
             <Button className="text-xs" onClick={replayAll} disabled={opsBusy || deadLetter.length === 0}>Replay All</Button>
           </div>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <input
+              value={providerFilter}
+              onChange={(e) => setProviderFilter(e.target.value)}
+              placeholder="provider"
+              aria-label="Dead letter provider filter"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            />
+            <input
+              value={eventFilter}
+              onChange={(e) => setEventFilter(e.target.value)}
+              placeholder="event_type"
+              aria-label="Dead letter event type filter"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            />
+            <select
+              value={replayStrategy}
+              onChange={(e) => setReplayStrategy(e.target.value as 'reset' | 'preserve' | 'backoff')}
+              aria-label="Replay strategy"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            >
+              <option value="backoff">backoff</option>
+              <option value="reset">reset</option>
+              <option value="preserve">preserve</option>
+            </select>
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={replayBatchSize}
+              onChange={(e) => setReplayBatchSize(Number(e.target.value || 20))}
+              aria-label="Replay batch size"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            />
+          </div>
           <div className="mt-2 space-y-1 max-h-44 overflow-auto custom-scrollbar">
             {deadLetter.map((j) => (
               <div key={j.id} className="rounded border border-amber-500/20 bg-amber-950/20 p-2 text-xs">
@@ -220,6 +314,50 @@ export default function Dashboard({ metrics }: Props) {
               </div>
             ))}
             {deadLetter.length === 0 && <div className="text-xs text-slate-500">Keine fehlgeschlagenen Jobs.</div>}
+          </div>
+        </Card>
+
+        <Card className="p-4 sm:col-span-2 lg:col-span-3">
+          <div className="text-xs font-semibold text-slate-400">Ops Backpressure Heat Panel</div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-300 font-semibold">Worker Utilization</span>
+                <span className="text-slate-400">{workerUtil}%</span>
+              </div>
+              <div className="mt-2 h-2 rounded bg-slate-900/80 overflow-hidden">
+                <progress
+                  className={`h-full w-full ${heatTone(workerUtil)}`}
+                  value={workerUtil}
+                  max={100}
+                  aria-label="Worker utilization"
+                />
+              </div>
+              <div className="mt-2 text-xs text-slate-500">
+                runs {ops?.worker.runs ?? 0} · skipped {ops?.worker.skipped ?? 0} · interval {ops?.worker.intervalMs ?? 0}ms
+              </div>
+            </div>
+
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-300 font-semibold">Webhook Processor Utilization</span>
+                <span className="text-slate-400">{webhookUtil}%</span>
+              </div>
+              <div className="mt-2 h-2 rounded bg-slate-900/80 overflow-hidden">
+                <progress
+                  className={`h-full w-full ${heatTone(webhookUtil)}`}
+                  value={webhookUtil}
+                  max={100}
+                  aria-label="Webhook processor utilization"
+                />
+              </div>
+              <div className="mt-2 text-xs text-slate-500">
+                pending {ops?.webhookProcessor.pendingJobs ?? 0} · failed {ops?.webhookProcessor.failedJobs ?? 0} · batch {ops?.webhookProcessor.batchSize ?? 0}
+              </div>
+            </div>
+          </div>
+          <div className="mt-2 text-xs text-slate-500">
+            Replay Policy: base {ops?.replayPolicy.baseDelayMs ?? 0}ms · max {ops?.replayPolicy.maxDelayMs ?? 0}ms · batch {ops?.replayPolicy.batchSize ?? 0}
           </div>
         </Card>
       </div>

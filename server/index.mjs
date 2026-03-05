@@ -491,9 +491,14 @@ function getLiveSnapshot() {
 
 const JOB_MAX_ATTEMPTS = 5;
 const JOB_BASE_DELAY_MS = 5000;
+const JOB_MAX_DELAY_MS = 60 * 60 * 1000;
+const DEFAULT_REPLAY_BATCH_SIZE = Number(process.env.REPLAY_BATCH_SIZE || 20);
 const DOWNLOAD_TTL_MS = 1000 * 60 * 60 * 24;
 const ENTERPRISE_CYCLE_MS = 10 * 60 * 1000;
 const ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+const PAYPAL_WEBHOOK_ID = String(process.env.PAYPAL_WEBHOOK_ID || '');
+const PAYPAL_API_BASE = String(process.env.PAYPAL_API_BASE || 'https://api-m.paypal.com');
 
 function normalizeExecutiveRole(rawRole) {
   const role = String(rawRole || '').trim().toUpperCase();
@@ -1502,8 +1507,86 @@ function enqueueWebhookJob(provider, eventType, payload) {
   ]);
 }
 
+function getReplayPolicy() {
+  const baseDelayMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_backoff_base_ms'])?.value || JOB_BASE_DELAY_MS);
+  const maxDelayMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_backoff_max_ms'])?.value || JOB_MAX_DELAY_MS);
+  const batchSize = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_batch_size'])?.value || DEFAULT_REPLAY_BATCH_SIZE);
+
+  return {
+    baseDelayMs: Number.isFinite(baseDelayMs) ? Math.max(1000, baseDelayMs) : JOB_BASE_DELAY_MS,
+    maxDelayMs: Number.isFinite(maxDelayMs) ? Math.max(1000, maxDelayMs) : JOB_MAX_DELAY_MS,
+    batchSize: Number.isFinite(batchSize) ? Math.max(1, Math.min(200, batchSize)) : DEFAULT_REPLAY_BATCH_SIZE
+  };
+}
+
+function computeBackoffDelay(attempts) {
+  const policy = getReplayPolicy();
+  return Math.min(policy.maxDelayMs, policy.baseDelayMs * Math.pow(2, Math.max(0, Number(attempts || 0))));
+}
+
+function setGlobalSetting(key, value) {
+  const existing = get('SELECT value FROM global_settings WHERE key = ?', [key]);
+  if (existing) run('UPDATE global_settings SET value = ? WHERE key = ?', [String(value), key]);
+  else run('INSERT INTO global_settings (key, value) VALUES (?, ?)', [key, String(value)]);
+}
+
+async function verifyPayPalWebhookNative(req, payload) {
+  if (!PAYPAL_WEBHOOK_ID || !process.env.PAYPAL_CLIENT_ID || !process.env.PAYPAL_CLIENT_SECRET) {
+    return { ok: false, reason: 'not_configured' };
+  }
+
+  const transmissionId = String(req.headers['paypal-transmission-id'] || '');
+  const transmissionTime = String(req.headers['paypal-transmission-time'] || '');
+  const certUrl = String(req.headers['paypal-cert-url'] || '');
+  const authAlgo = String(req.headers['paypal-auth-algo'] || '');
+  const transmissionSig = String(req.headers['paypal-transmission-sig'] || '');
+
+  if (!transmissionId || !transmissionTime || !certUrl || !authAlgo || !transmissionSig) {
+    return { ok: false, reason: 'missing_headers' };
+  }
+
+  const authRaw = Buffer.from(`${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`, 'utf8').toString('base64');
+  const tokenRes = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${authRaw}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+  if (!tokenRes.ok) {
+    return { ok: false, reason: 'oauth_failed' };
+  }
+  const tokenJson = await tokenRes.json();
+  const accessToken = String(tokenJson?.access_token || '');
+  if (!accessToken) return { ok: false, reason: 'oauth_token_missing' };
+
+  const verifyRes = await fetch(`${PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      transmission_id: transmissionId,
+      transmission_time: transmissionTime,
+      cert_url: certUrl,
+      auth_algo: authAlgo,
+      transmission_sig: transmissionSig,
+      webhook_id: PAYPAL_WEBHOOK_ID,
+      webhook_event: payload
+    })
+  });
+  if (!verifyRes.ok) {
+    return { ok: false, reason: 'verify_request_failed' };
+  }
+  const verifyJson = await verifyRes.json();
+  const status = String(verifyJson?.verification_status || '').toUpperCase();
+  return { ok: status === 'SUCCESS', reason: status || 'unknown' };
+}
+
 function markJobRetry(jobId, attempts) {
-  const delay = Math.min(60 * 60 * 1000, JOB_BASE_DELAY_MS * Math.pow(2, attempts));
+  const delay = computeBackoffDelay(attempts);
   run('UPDATE webhook_jobs SET attempts = ?, next_run = ?, updated_at = ? WHERE id = ?', [
     attempts,
     Date.now() + delay,
@@ -2067,23 +2150,37 @@ app.post('/api/webhooks/paypal', async (req, reply) => {
   }
 
   const incomingToken = String(req.headers['x-webhook-token'] || '');
+  const payload = req.body || {};
+  const payloadRaw = JSON.stringify(payload);
   if (!safeTokenMatch(incomingToken, configuredToken)) {
     saveWebhookEvent({
       provider: 'paypal',
       eventId: `invalid_${Date.now()}`,
       eventType: 'token.invalid',
       signatureRaw: incomingToken,
-      payloadRaw: JSON.stringify(req.body || {}),
+      payloadRaw,
       status: 'rejected',
       errorMessage: 'Invalid webhook token'
     });
     return reply.code(401).send({ error: 'Invalid webhook token' });
   }
 
-  const payload = req.body || {};
+  const nativeVerify = await verifyPayPalWebhookNative(req, payload);
+  if (!nativeVerify.ok) {
+    saveWebhookEvent({
+      provider: 'paypal',
+      eventId: `invalid_${Date.now()}`,
+      eventType: 'signature.invalid',
+      signatureRaw: incomingToken,
+      payloadRaw,
+      status: 'rejected',
+      errorMessage: `Native verification failed: ${nativeVerify.reason}`
+    });
+    return reply.code(401).send({ error: `PayPal signature invalid (${nativeVerify.reason})` });
+  }
+
   const eventId = String(payload.id || '');
   const eventType = String(payload.event_type || 'unknown');
-  const payloadRaw = JSON.stringify(payload);
   if (!eventId) {
     saveWebhookEvent({
       provider: 'paypal',
@@ -2129,7 +2226,35 @@ app.post('/api/webhooks/paypal', async (req, reply) => {
 app.get('/api/webhooks/dead-letter', async (req) => {
   const limitRaw = Number(req.query?.limit ?? 50);
   const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 50;
-  return all('SELECT * FROM webhook_jobs WHERE status = ? ORDER BY updated_at DESC LIMIT ?', ['failed', limit]);
+  const provider = String(req.query?.provider || '').trim();
+  const eventType = String(req.query?.eventType || '').trim();
+  const attemptsMinRaw = Number(req.query?.attemptsMin ?? 0);
+  const attemptsMin = Number.isFinite(attemptsMinRaw) ? Math.max(0, attemptsMinRaw) : 0;
+  const status = String(req.query?.status || 'failed').trim().toLowerCase() || 'failed';
+
+  return all(
+    'SELECT * FROM webhook_jobs WHERE status = ? AND (? = "" OR provider = ?) AND (? = "" OR event_type = ?) AND attempts >= ? ORDER BY updated_at DESC LIMIT ?',
+    [status, provider, provider, eventType, eventType, attemptsMin, limit]
+  );
+});
+
+app.get('/api/webhooks/replay_policy', async () => {
+  return getReplayPolicy();
+});
+
+app.put('/api/webhooks/replay_policy', async (req, reply) => {
+  const { baseDelayMs, maxDelayMs, batchSize } = req.body ?? {};
+  if (!Number.isFinite(Number(baseDelayMs)) || !Number.isFinite(Number(maxDelayMs)) || !Number.isFinite(Number(batchSize))) {
+    return reply.code(400).send({ error: 'baseDelayMs/maxDelayMs/batchSize required' });
+  }
+
+  const normalizedBase = Math.max(1000, Number(baseDelayMs));
+  const normalizedMax = Math.max(normalizedBase, Number(maxDelayMs));
+  const normalizedBatch = Math.max(1, Math.min(200, Number(batchSize)));
+  setGlobalSetting('replay_backoff_base_ms', normalizedBase);
+  setGlobalSetting('replay_backoff_max_ms', normalizedMax);
+  setGlobalSetting('replay_batch_size', normalizedBatch);
+  return getReplayPolicy();
 });
 
 app.post('/api/webhooks/replay/:id', async (req, reply) => {
@@ -2137,48 +2262,74 @@ app.post('/api/webhooks/replay/:id', async (req, reply) => {
   const row = get('SELECT * FROM webhook_jobs WHERE id = ? LIMIT 1', [id]);
   if (!row) return reply.code(404).send({ error: 'job not found' });
 
+  const strategy = String(req.body?.strategy || 'reset').toLowerCase();
+  const attempts = strategy === 'preserve' ? Number(row.attempts || 0) : 0;
+  const nextRun = Date.now() + (strategy === 'backoff' ? computeBackoffDelay(attempts) : 0);
+
   run('UPDATE webhook_jobs SET status = ?, attempts = ?, next_run = ?, updated_at = ? WHERE id = ?', [
     'pending',
-    0,
-    Date.now(),
+    attempts,
+    nextRun,
     Date.now(),
     id
   ]);
 
-  return { ok: true, id };
+  return { ok: true, id, strategy, attempts, nextRun };
 });
 
-app.post('/api/webhooks/replay_failed', async () => {
-  const failed = all('SELECT id FROM webhook_jobs WHERE status = ?', ['failed']);
-  run('UPDATE webhook_jobs SET status = ?, attempts = ?, next_run = ?, updated_at = ? WHERE status = ?', [
-    'pending',
-    0,
-    Date.now(),
-    Date.now(),
-    'failed'
-  ]);
-  return { ok: true, count: failed.length };
-});
+app.post('/api/webhooks/replay_failed', async (req) => {
+  const provider = String(req.body?.provider || '').trim();
+  const eventType = String(req.body?.eventType || '').trim();
+  const strategy = String(req.body?.strategy || 'reset').toLowerCase();
+  const batchSizeRaw = Number(req.body?.batchSize ?? getReplayPolicy().batchSize);
+  const batchSize = Number.isFinite(batchSizeRaw) ? Math.max(1, Math.min(500, batchSizeRaw)) : getReplayPolicy().batchSize;
 
-app.get('/api/ops/backpressure', async () => ({
-  worker: {
-    busy: workerCycleBusy,
-    runs: workerCycleRuns,
-    skipped: workerCycleSkipped,
-    lastDurationMs: workerCycleLastDurationMs,
-    lastAt: workerCycleLastAt,
-    intervalMs: WORKER_INTERVAL_MS
-  },
-  webhookProcessor: {
-    busy: webhookProcessorBusy,
-    runs: webhookProcessorRuns,
-    skipped: webhookProcessorSkipped,
-    lastDurationMs: webhookProcessorLastDurationMs,
-    lastAt: webhookProcessorLastAt,
-    intervalMs: WEBHOOK_PROCESS_INTERVAL_MS,
-    batchSize: WEBHOOK_JOB_BATCH_SIZE
+  const rows = all(
+    'SELECT id, attempts FROM webhook_jobs WHERE status = ? AND (? = "" OR provider = ?) AND (? = "" OR event_type = ?) ORDER BY updated_at DESC LIMIT ?',
+    ['failed', provider, provider, eventType, eventType, batchSize]
+  );
+
+  for (const row of rows) {
+    const attempts = strategy === 'preserve' ? Number(row.attempts || 0) : 0;
+    const nextRun = Date.now() + (strategy === 'backoff' ? computeBackoffDelay(attempts) : 0);
+    run('UPDATE webhook_jobs SET status = ?, attempts = ?, next_run = ?, updated_at = ? WHERE id = ?', [
+      'pending',
+      attempts,
+      nextRun,
+      Date.now(),
+      row.id
+    ]);
   }
-}));
+
+  return { ok: true, count: rows.length, strategy, provider: provider || null, eventType: eventType || null, batchSize };
+});
+
+app.get('/api/ops/backpressure', async () => {
+  const pendingJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['pending'])?.c || 0);
+  const failedJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['failed'])?.c || 0);
+  return {
+    worker: {
+      busy: workerCycleBusy,
+      runs: workerCycleRuns,
+      skipped: workerCycleSkipped,
+      lastDurationMs: workerCycleLastDurationMs,
+      lastAt: workerCycleLastAt,
+      intervalMs: WORKER_INTERVAL_MS
+    },
+    webhookProcessor: {
+      busy: webhookProcessorBusy,
+      runs: webhookProcessorRuns,
+      skipped: webhookProcessorSkipped,
+      lastDurationMs: webhookProcessorLastDurationMs,
+      lastAt: webhookProcessorLastAt,
+      intervalMs: WEBHOOK_PROCESS_INTERVAL_MS,
+      batchSize: WEBHOOK_JOB_BATCH_SIZE,
+      pendingJobs,
+      failedJobs
+    },
+    replayPolicy: getReplayPolicy()
+  };
+});
 
 app.get('/api/download/:token', async (req, reply) => {
   const { token } = req.params;
