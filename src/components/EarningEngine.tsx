@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import ViewLayout from './ViewLayout';
 import { Badge, Button, Card } from './ui';
 import { apiGet, apiSend } from '../lib/api';
+import { subscribeLive } from '../lib/live';
 
 type Tx = {
   id: string;
@@ -41,6 +42,24 @@ export default function EarningEngine() {
 
   useEffect(() => {
     loadTransactions();
+    const unsub = subscribeLive((msg) => {
+      if (msg.event === 'sync') {
+        const payload = msg.payload as { transactions?: Tx[] };
+        if (Array.isArray(payload?.transactions)) setTx(payload.transactions);
+        return;
+      }
+
+      if (msg.event === 'txn:created') {
+        const row = msg.payload as Tx;
+        if (!row?.id) return;
+        setTx((prev) => {
+          if (prev.some((t) => t.id === row.id)) return prev;
+          return [row, ...prev].slice(0, 100);
+        });
+      }
+    });
+
+    return () => unsub();
   }, []);
 
   const addTx = async () => {

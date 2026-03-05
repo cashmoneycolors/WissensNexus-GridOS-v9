@@ -290,6 +290,34 @@ Nutzen:
 - Priorisierung umsatzstarker Kategorien statt Bauchgefuehl
 - Schnellere operative Entscheidungen durch 30/60/90-Projektionen
 
+## 15) Stufe 6: Live-Events + Telemetry + Webhook-Security
+
+Datei: `server/index.mjs`, `server/db.mjs`, `src/lib/live.ts`, `src/components/TaskMatrix.tsx`, `src/components/EarningEngine.tsx`
+
+Umgesetzt:
+
+- WebSocket Live-Updates (Tasks/Transactions)
+  - Initialer Sync beim Connect (`event: sync`)
+  - Event-Streams fuer `task:created|updated|deleted` und `txn:created`
+  - Frontend von hartem Polling auf event-getriebenen Update-Pfad umgestellt (mit leichtem Fallback-Polling)
+- Zentrales Logging/Tracing
+  - Request-Hooks fuer End-to-End-Latenz und Statuscode
+  - Persistente Trace-Speicherung in `request_traces`
+  - Neue APIs:
+    - `GET /api/telemetry/summary?windowMinutes=60`
+    - `GET /api/telemetry/recent?limit=50`
+  - Slow-Request-Warnungen via `SLOW_REQUEST_MS`
+- Webhook-Security-Hardening
+  - Neue Tabelle `webhook_events` mit dedizierter Idempotenz (`provider + event_id` unique)
+  - Stripe-Webhook: Signaturpruefung + Duplicate-Block + Audit-Status (`accepted|ignored|duplicate|rejected`)
+  - PayPal-Webhook-Pfad: tokenbasierte Verifikation pro Provider-Route + Idempotenz/Audit
+
+Nutzen:
+
+- Weniger Last und schnellere UI-Reaktion bei Task/Transaction-Updates
+- Messbare API-Qualitaet (Latenz/Fehlerrate) statt Blackbox
+- Robustere Webhook-Verarbeitung gegen Replay/Duplicate/Fehlkonfiguration
+
 ## Bekannte Folgeaenderung
 
 Datei: `server/data.sqlite`

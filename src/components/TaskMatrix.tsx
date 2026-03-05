@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import ViewLayout from './ViewLayout';
 import { Badge, Button, Card } from './ui';
 import { apiGet, apiSend } from '../lib/api';
+import { subscribeLive } from '../lib/live';
 
 type Task = {
   id: string;
@@ -29,10 +30,45 @@ export default function TaskMatrix() {
         });
 
     load();
+    const unsub = subscribeLive((msg) => {
+      if (msg.event === 'sync') {
+        const payload = msg.payload as { tasks?: Task[] };
+        if (Array.isArray(payload?.tasks)) setTasks(payload.tasks);
+        return;
+      }
+
+      if (msg.event === 'task:created') {
+        const row = msg.payload as Task;
+        if (!row?.id) return;
+        setTasks((prev) => {
+          if (prev.some((t) => t.id === row.id)) return prev;
+          return [row, ...prev].slice(0, 60);
+        });
+        return;
+      }
+
+      if (msg.event === 'task:updated') {
+        const row = msg.payload as Task;
+        if (!row?.id) return;
+        setTasks((prev) => prev.map((t) => (t.id === row.id ? row : t)));
+        return;
+      }
+
+      if (msg.event === 'task:deleted') {
+        const payload = msg.payload as { id?: string };
+        if (!payload?.id) return;
+        setTasks((prev) => prev.filter((t) => t.id !== payload.id));
+      }
+    });
+
     const i = setInterval(() => {
       if (document.visibilityState === 'visible') load();
-    }, 5000);
-    return () => clearInterval(i);
+    }, 20000);
+
+    return () => {
+      clearInterval(i);
+      unsub();
+    };
   }, []);
 
   const doneCount = useMemo(() => tasks.filter((t) => t.done).length, [tasks]);

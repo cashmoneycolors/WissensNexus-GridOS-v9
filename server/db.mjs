@@ -204,6 +204,35 @@ export function migrate() {
       updated_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS webhook_events (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      signature_hash TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error_message TEXT NOT NULL,
+      received_at INTEGER NOT NULL,
+      processed_at INTEGER
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_events_provider_event_id
+      ON webhook_events(provider, event_id);
+
+    CREATE TABLE IF NOT EXISTS request_traces (
+      id TEXT PRIMARY KEY,
+      method TEXT NOT NULL,
+      route TEXT NOT NULL,
+      status_code INTEGER NOT NULL,
+      latency_ms REAL NOT NULL,
+      ok INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_request_traces_created_at
+      ON request_traces(created_at);
+
     CREATE TABLE IF NOT EXISTS business_alerts (
       id TEXT PRIMARY KEY,
       kind TEXT NOT NULL,

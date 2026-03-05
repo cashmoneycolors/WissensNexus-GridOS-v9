@@ -164,6 +164,51 @@ await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
 
 await initDb();
 
+const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS || 1200);
+const TRACE_RETENTION_LIMIT = 5000;
+
+function recordTrace(method, route, statusCode, latencyMs) {
+  run(
+    'INSERT INTO request_traces (id, method, route, status_code, latency_ms, ok, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [
+      `trace_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      method,
+      route,
+      Number(statusCode),
+      Number(latencyMs.toFixed(2)),
+      statusCode < 400 ? 1 : 0,
+      Date.now()
+    ]
+  );
+
+  run(
+    'DELETE FROM request_traces WHERE id IN (SELECT id FROM request_traces ORDER BY created_at DESC LIMIT -1 OFFSET ?)',
+    [TRACE_RETENTION_LIMIT]
+  );
+}
+
+app.addHook('onRequest', async (req) => {
+  req.traceStart = process.hrtime.bigint();
+});
+
+app.addHook('onResponse', async (req, reply) => {
+  const start = typeof req.traceStart === 'bigint' ? req.traceStart : process.hrtime.bigint();
+  const latencyMs = Number(process.hrtime.bigint() - start) / 1e6;
+  const route = req.routeOptions?.url || req.routerPath || req.url || 'unknown';
+  const method = req.method || 'UNKNOWN';
+  const statusCode = Number(reply.statusCode || 500);
+
+  try {
+    recordTrace(method, route, statusCode, latencyMs);
+  } catch {
+    // tracing should never break request flow
+  }
+
+  if (latencyMs >= SLOW_REQUEST_MS) {
+    console.warn(`[trace][slow] ${method} ${route} ${statusCode} ${latencyMs.toFixed(1)}ms`);
+  }
+});
+
 for (const item of DEFAULT_CATALOG) {
   const existing = get('SELECT category FROM product_catalog WHERE category = ?', [item.category]);
   if (!existing) {
@@ -402,6 +447,14 @@ function broadcast(event, payload) {
       // ignore
     }
   }
+}
+
+function getLiveSnapshot() {
+  return {
+    tasks: all('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 30'),
+    transactions: all('SELECT * FROM transactions ORDER BY created_at DESC LIMIT 20'),
+    ts: Date.now()
+  };
 }
 
 const JOB_MAX_ATTEMPTS = 5;
@@ -1363,6 +1416,46 @@ function createProductMeta(productId, title, category, price, currency, wordCoun
   ]);
 }
 
+function sha256(input) {
+  return crypto.createHash('sha256').update(String(input || ''), 'utf8').digest('hex');
+}
+
+function safeTokenMatch(a, b) {
+  if (!a || !b) return false;
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function isWebhookEventSeen(provider, eventId) {
+  if (!provider || !eventId) return false;
+  const row = get('SELECT id FROM webhook_events WHERE provider = ? AND event_id = ? LIMIT 1', [provider, String(eventId)]);
+  return Boolean(row);
+}
+
+function saveWebhookEvent({ provider, eventId, eventType, signatureRaw, payloadRaw, status, errorMessage = '' }) {
+  try {
+    run(
+      'INSERT INTO webhook_events (id, provider, event_id, event_type, signature_hash, payload_hash, status, error_message, received_at, processed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        `wh_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        String(provider || 'unknown'),
+        String(eventId || `unknown_${Date.now()}`),
+        String(eventType || 'unknown'),
+        sha256(signatureRaw || ''),
+        sha256(payloadRaw || ''),
+        String(status || 'received'),
+        String(errorMessage || ''),
+        Date.now(),
+        status === 'accepted' || status === 'duplicate' || status === 'ignored' ? Date.now() : null
+      ]
+    );
+  } catch {
+    // duplicate or malformed event metadata should not block webhook response
+  }
+}
+
 function enqueueWebhookJob(provider, eventType, payload) {
   run('INSERT INTO webhook_jobs (id, provider, event_type, payload, status, attempts, next_run, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [
     `job_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -1520,14 +1613,17 @@ function recordSale({ provider, amount, currency, productId, buyerEmail, provide
     providerRef,
     Date.now()
   ]);
+  const txId = `txn_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   run('INSERT INTO transactions (id, type, amount, currency, note, created_at) VALUES (?, ?, ?, ?, ?, ?)', [
-    `txn_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    txId,
     'income',
     amount,
     currency,
     `Sale ${provider}: ${productId}`,
     Date.now()
   ]);
+  const txRow = get('SELECT * FROM transactions WHERE id = ?', [txId]);
+  if (txRow) broadcast('txn:created', txRow);
   return id;
 }
 
@@ -1804,15 +1900,129 @@ app.post('/api/webhooks/stripe', { config: { rawBody: true } }, async (req, repl
   const signature = req.headers['stripe-signature'];
   if (!signature) return reply.code(400).send({ error: 'Missing stripe signature' });
 
+  const raw = String(req.rawBody || '');
+
   let event;
   try {
-    event = stripe.webhooks.constructEvent(req.rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET);
+    event = stripe.webhooks.constructEvent(raw, signature, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
+    saveWebhookEvent({
+      provider: 'stripe',
+      eventId: `invalid_${Date.now()}`,
+      eventType: 'signature.invalid',
+      signatureRaw: signature,
+      payloadRaw: raw,
+      status: 'rejected',
+      errorMessage: 'Invalid signature'
+    });
     return reply.code(400).send({ error: 'Invalid signature' });
   }
 
-  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+  const eventId = String(event.id || '');
+  if (!eventId) {
+    saveWebhookEvent({
+      provider: 'stripe',
+      eventId: `missing_${Date.now()}`,
+      eventType: String(event.type || 'unknown'),
+      signatureRaw: signature,
+      payloadRaw: raw,
+      status: 'rejected',
+      errorMessage: 'Missing event id'
+    });
+    return reply.code(400).send({ error: 'Invalid webhook event' });
+  }
+
+  if (isWebhookEventSeen('stripe', eventId)) {
+    saveWebhookEvent({
+      provider: 'stripe',
+      eventId,
+      eventType: String(event.type || 'unknown'),
+      signatureRaw: signature,
+      payloadRaw: raw,
+      status: 'duplicate'
+    });
+    return { received: true, duplicate: true };
+  }
+
+  const supported = event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded';
+
+  saveWebhookEvent({
+    provider: 'stripe',
+    eventId,
+    eventType: String(event.type || 'unknown'),
+    signatureRaw: signature,
+    payloadRaw: raw,
+    status: supported ? 'accepted' : 'ignored'
+  });
+
+  if (supported) {
     enqueueWebhookJob('stripe', event.type, event);
+  }
+
+  return { received: true };
+});
+
+app.post('/api/webhooks/paypal', async (req, reply) => {
+  const configuredToken = String(process.env.PAYPAL_WEBHOOK_TOKEN || '');
+  if (!configuredToken) {
+    return reply.code(503).send({ error: 'PayPal webhook token not configured' });
+  }
+
+  const incomingToken = String(req.headers['x-webhook-token'] || '');
+  if (!safeTokenMatch(incomingToken, configuredToken)) {
+    saveWebhookEvent({
+      provider: 'paypal',
+      eventId: `invalid_${Date.now()}`,
+      eventType: 'token.invalid',
+      signatureRaw: incomingToken,
+      payloadRaw: JSON.stringify(req.body || {}),
+      status: 'rejected',
+      errorMessage: 'Invalid webhook token'
+    });
+    return reply.code(401).send({ error: 'Invalid webhook token' });
+  }
+
+  const payload = req.body || {};
+  const eventId = String(payload.id || '');
+  const eventType = String(payload.event_type || 'unknown');
+  const payloadRaw = JSON.stringify(payload);
+  if (!eventId) {
+    saveWebhookEvent({
+      provider: 'paypal',
+      eventId: `missing_${Date.now()}`,
+      eventType,
+      signatureRaw: incomingToken,
+      payloadRaw,
+      status: 'rejected',
+      errorMessage: 'Missing event id'
+    });
+    return reply.code(400).send({ error: 'Missing event id' });
+  }
+
+  if (isWebhookEventSeen('paypal', eventId)) {
+    saveWebhookEvent({
+      provider: 'paypal',
+      eventId,
+      eventType,
+      signatureRaw: incomingToken,
+      payloadRaw,
+      status: 'duplicate'
+    });
+    return { received: true, duplicate: true };
+  }
+
+  const supported = eventType === 'PAYMENT.CAPTURE.COMPLETED';
+  saveWebhookEvent({
+    provider: 'paypal',
+    eventId,
+    eventType,
+    signatureRaw: incomingToken,
+    payloadRaw,
+    status: supported ? 'accepted' : 'ignored'
+  });
+
+  if (supported) {
+    enqueueWebhookJob('paypal', eventType, payload);
   }
 
   return { received: true };
@@ -2047,7 +2257,46 @@ ${snapshotText}`
 app.get('/ws', { websocket: true }, (conn) => {
   sockets.add(conn.socket);
   conn.socket.send(JSON.stringify({ event: 'hello', payload: { ts: Date.now() } }));
+  conn.socket.send(JSON.stringify({ event: 'sync', payload: getLiveSnapshot() }));
   conn.socket.on('close', () => sockets.delete(conn.socket));
+});
+
+app.get('/api/telemetry/summary', async (req) => {
+  const windowMinutesRaw = Number(req.query?.windowMinutes ?? 60);
+  const windowMinutes = Number.isFinite(windowMinutesRaw) ? Math.max(5, Math.min(24 * 60, windowMinutesRaw)) : 60;
+  const since = Date.now() - windowMinutes * 60 * 1000;
+
+  const stats = get(
+    'SELECT COUNT(*) as total, AVG(latency_ms) as avg_latency, MAX(latency_ms) as max_latency, SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) as ok_count, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) as err_count FROM request_traces WHERE created_at >= ?',
+    [since]
+  ) || { total: 0, avg_latency: 0, max_latency: 0, ok_count: 0, err_count: 0 };
+
+  const topSlow = all(
+    'SELECT route, method, COUNT(*) as hits, AVG(latency_ms) as avg_latency FROM request_traces WHERE created_at >= ? GROUP BY route, method ORDER BY avg_latency DESC LIMIT 8',
+    [since]
+  );
+
+  const total = Number(stats.total || 0);
+  const errCount = Number(stats.err_count || 0);
+  return {
+    windowMinutes,
+    totalRequests: total,
+    avgLatencyMs: Number(Number(stats.avg_latency || 0).toFixed(2)),
+    maxLatencyMs: Number(Number(stats.max_latency || 0).toFixed(2)),
+    errorRate: total > 0 ? Number((errCount / total).toFixed(4)) : 0,
+    slowRoutes: topSlow.map((r) => ({
+      route: r.route,
+      method: r.method,
+      hits: Number(r.hits || 0),
+      avgLatencyMs: Number(Number(r.avg_latency || 0).toFixed(2))
+    }))
+  };
+});
+
+app.get('/api/telemetry/recent', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 50);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, limitRaw)) : 50;
+  return all('SELECT method, route, status_code, latency_ms, ok, created_at FROM request_traces ORDER BY created_at DESC LIMIT ?', [limit]);
 });
 
 app.get('/api/metrics', async () => {
