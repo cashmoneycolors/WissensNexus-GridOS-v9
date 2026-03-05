@@ -38,7 +38,10 @@ export default function ToolBox() {
       <div className="grid gap-3 lg:grid-cols-2">
         <Card className="p-4">
           <div className="text-sm font-bold">JSON Formatter</div>
+          <label htmlFor="toolbox-json-input" className="mt-2 block text-xs text-slate-400">JSON Input</label>
           <textarea
+            id="toolbox-json-input"
+            aria-label="JSON input"
             value={jsonInput}
             onChange={(e) => setJsonInput(e.target.value)}
             className="mt-2 h-40 w-full rounded-xl border border-slate-800/80 bg-black/40 p-3 text-xs font-mono"
@@ -51,7 +54,10 @@ export default function ToolBox() {
 
         <Card className="p-4">
           <div className="text-sm font-bold">Base64 Encode/Decode</div>
+          <label htmlFor="toolbox-base64-input" className="mt-2 block text-xs text-slate-400">Text/Input</label>
           <input
+            id="toolbox-base64-input"
+            aria-label="Base64 source input"
             value={base64Input}
             onChange={(e) => setBase64Input(e.target.value)}
             className="mt-2 w-full rounded-xl border border-slate-800/80 bg-black/40 px-3 py-2 text-sm"

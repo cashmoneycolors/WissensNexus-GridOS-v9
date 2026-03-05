@@ -34,7 +34,10 @@ export default function MediaAnalyzer() {
     <ViewLayout title="Media Analyzer" subtitle="Text/File Analyse mit Persistenz.">
       <div className="grid gap-3 lg:grid-cols-[1fr,360px]">
         <Card className="p-4">
+          <label htmlFor="media-analyzer-text" className="text-xs text-slate-400">Input Text</label>
           <textarea
+            id="media-analyzer-text"
+            aria-label="Input text for analysis"
             value={text}
             onChange={(e) => setText(e.target.value)}
             className="h-40 w-full rounded-xl border border-slate-800/80 bg-black/40 p-3 text-sm"
@@ -45,6 +48,7 @@ export default function MediaAnalyzer() {
               Upload File
               <input
                 type="file"
+                aria-label="Upload file for analysis"
                 className="hidden"
                 onChange={(e) => analyzeFile(e.target.files?.[0])}
               />
