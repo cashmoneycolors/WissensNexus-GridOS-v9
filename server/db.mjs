@@ -203,6 +203,17 @@ export function migrate() {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS business_alerts (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      acknowledged INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
   `);
 
   const ensureColumn = (table, column, def) => {
@@ -406,5 +417,19 @@ export function seedIfEmpty() {
   const existingBudget = get('SELECT value FROM global_settings WHERE key = ?', ['daily_budget']);
   if (!existingBudget) {
     run('INSERT INTO global_settings (key, value) VALUES (?, ?)', ['daily_budget', '100']);
+  }
+
+  const defaults = [
+    ['executive_role', 'CEO'],
+    ['alert_margin_threshold', '0.20'],
+    ['alert_runway_days_threshold', '90'],
+    ['alert_critical_tasks_threshold', '25'],
+    ['weekly_ops_enabled', '1'],
+    ['weekly_ops_last_key', '']
+  ];
+
+  for (const [key, value] of defaults) {
+    const existing = get('SELECT value FROM global_settings WHERE key = ?', [key]);
+    if (!existing) run('INSERT INTO global_settings (key, value) VALUES (?, ?)', [key, value]);
   }
 }

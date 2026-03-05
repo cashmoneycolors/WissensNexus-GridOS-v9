@@ -123,6 +123,59 @@ Umgesetzt:
 Nutzen:
 - Verhindert doppelte Prozesssteuerung und instabile Testlaeufe
 
+## 10) Business-Intelligenz auf Executive-Niveau
+
+Datei: `server/index.mjs`
+
+Umgesetzt:
+
+- Neuer Business-KPI-Snapshot mit 30-Tage-Fenster:
+  - Revenue, Cost, Net, Margin
+  - Balance, Burn/Day, Runway
+  - Open/Critical Tasks, Orders, Top Category
+- Chat-Systemrolle auf "Executive Operator" erweitert (Lagebild, Hebel, Risiko, naechster Schritt)
+- Neue steuerbare Business-Befehle im Chat:
+  - `>> KPI: <metric_name>`
+  - `>> DECIDE: <Option A> || <Option B> ...`
+  - `>> PLAN: <Goal> || <HorizonDays>`
+- Decision-Engine mit deterministischem Scoring fuer Optionen
+- Plan-Generator mit automatischer Task-Anlage (inkl. Prioritaeten)
+- Neuer API-Endpoint: `GET /api/business/snapshot`
+
+Nutzen:
+
+- Antworten und Entscheidungen sind wirtschaftlich strukturierter
+- Autonome Ausfuehrung kann direkt operative Tasks erzeugen
+- KPI-getriebene Steuerung statt rein generischer Chat-Antworten
+
+## 11) Stufe 2: Enterprise Intelligence
+
+Datei: `server/index.mjs`, `server/db.mjs`
+
+Umgesetzt:
+
+- Rollenbasiertes Entscheidungsprofil (`CEO`, `CFO`, `COO`) mit persistenter Speicherung
+  - API: `GET/PUT /api/business/role`
+  - Chat-Kommando: `>> ROLE: <CEO|CFO|COO>`
+- Weekly Operating System (automatische Wochen-Review-Tasks)
+  - Zyklus: automatisch alle 10 Minuten geprueft, Tasks pro Kalenderwoche nur einmal angelegt
+  - API: `POST /api/business/weekly/review`
+- KPI-Alerting mit Schwellwerten und Cooldown
+  - Persistente Alerts in neuer Tabelle `business_alerts`
+  - Alert-Typen: `margin`, `runway`, `critical_tasks`
+  - API: `GET /api/business/alerts`, `POST /api/business/alerts/evaluate`, `POST /api/business/alerts/ack_all`
+  - Schwellwerte per API konfigurierbar: `GET/PUT /api/business/thresholds`
+- Rollenabhaengiges Decision-Scoring + Plan-Generator
+  - CFO priorisiert Cash/Marge
+  - COO priorisiert Delivery/Prozess
+  - CEO priorisiert Wachstum/Strategie
+
+Nutzen:
+
+- Fuehrungsmodus ist gezielt steuerbar statt generisch
+- Woechentliche Steuerungsroutine laeuft autonom
+- Risiken werden als Alerts frueh sichtbar und nachvollziehbar gespeichert
+
 ## Bekannte Folgeaenderung
 Datei: `server/data.sqlite`
 

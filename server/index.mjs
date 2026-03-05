@@ -407,6 +407,175 @@ function broadcast(event, payload) {
 const JOB_MAX_ATTEMPTS = 5;
 const JOB_BASE_DELAY_MS = 5000;
 const DOWNLOAD_TTL_MS = 1000 * 60 * 60 * 24;
+const ENTERPRISE_CYCLE_MS = 10 * 60 * 1000;
+const ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+function normalizeExecutiveRole(rawRole) {
+  const role = String(rawRole || '').trim().toUpperCase();
+  if (role === 'CFO' || role === 'COO' || role === 'CEO') return role;
+  return 'CEO';
+}
+
+function getExecutiveRole() {
+  const value = get('SELECT value FROM global_settings WHERE key = ?', ['executive_role'])?.value;
+  return normalizeExecutiveRole(value);
+}
+
+function setExecutiveRole(role) {
+  const next = normalizeExecutiveRole(role);
+  const existing = get('SELECT value FROM global_settings WHERE key = ?', ['executive_role']);
+  if (existing) run('UPDATE global_settings SET value = ? WHERE key = ?', [next, 'executive_role']);
+  else run('INSERT INTO global_settings (key, value) VALUES (?, ?)', ['executive_role', next]);
+  return next;
+}
+
+function getExecutiveRoleDirective(role) {
+  if (role === 'CFO') {
+    return 'Rollenfokus CFO: Cashflow, Marge, Kapitaldisziplin, Pricing und Risikoabsicherung.';
+  }
+  if (role === 'COO') {
+    return 'Rollenfokus COO: Delivery-Qualitaet, Durchlaufzeit, Engpassmanagement und Prozessstabilitaet.';
+  }
+  return 'Rollenfokus CEO: Gesamtstrategie, Wachstum, Priorisierung und Ressourcenallokation.';
+}
+
+function getAlertThresholds() {
+  const margin = Number(get('SELECT value FROM global_settings WHERE key = ?', ['alert_margin_threshold'])?.value || 0.2);
+  const runwayDays = Number(get('SELECT value FROM global_settings WHERE key = ?', ['alert_runway_days_threshold'])?.value || 90);
+  const criticalTasks = Number(get('SELECT value FROM global_settings WHERE key = ?', ['alert_critical_tasks_threshold'])?.value || 25);
+  return {
+    margin: Number.isFinite(margin) ? margin : 0.2,
+    runwayDays: Number.isFinite(runwayDays) ? runwayDays : 90,
+    criticalTasks: Number.isFinite(criticalTasks) ? criticalTasks : 25
+  };
+}
+
+function getIsoWeekKey(ts = Date.now()) {
+  const d = new Date(ts);
+  d.setUTCHours(0, 0, 0, 0);
+  const day = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+}
+
+function ensureWeeklyOpsTasks(snapshot) {
+  const enabled = Number(get('SELECT value FROM global_settings WHERE key = ?', ['weekly_ops_enabled'])?.value || 1) === 1;
+  if (!enabled) return { created: 0, weekKey: getIsoWeekKey() };
+
+  const weekKey = getIsoWeekKey();
+  const lastKey = String(get('SELECT value FROM global_settings WHERE key = ?', ['weekly_ops_last_key'])?.value || '');
+  if (lastKey === weekKey) return { created: 0, weekKey };
+
+  const role = getExecutiveRole();
+  const focus = role === 'CFO' ? 'Cash & Margin' : role === 'COO' ? 'Execution & Delivery' : 'Growth & Allocation';
+  const steps = [
+    `Weekly OS (${weekKey}) - ${focus}: KPI-Review und Zielkorridor freigeben`,
+    `Weekly OS (${weekKey}) - Prioritaetenliste finalisieren (Top 3 Hebel)`,
+    `Weekly OS (${weekKey}) - Risiko-Check und Gegenmassnahmen dokumentieren`
+  ];
+
+  for (let i = 0; i < steps.length; i += 1) {
+    const id = `task_${Date.now()}_${Math.random().toString(16).slice(2)}_${i}`;
+    run('INSERT INTO tasks (id, title, done, priority, created_at) VALUES (?, ?, ?, ?, ?)', [
+      id,
+      steps[i],
+      0,
+      i === 0 ? 1 : 2,
+      Date.now()
+    ]);
+    const row = get('SELECT * FROM tasks WHERE id = ?', [id]);
+    broadcast('task:created', row);
+  }
+
+  const existing = get('SELECT value FROM global_settings WHERE key = ?', ['weekly_ops_last_key']);
+  if (existing) run('UPDATE global_settings SET value = ? WHERE key = ?', [weekKey, 'weekly_ops_last_key']);
+  else run('INSERT INTO global_settings (key, value) VALUES (?, ?)', ['weekly_ops_last_key', weekKey]);
+
+  return { created: steps.length, weekKey };
+}
+
+function createBusinessAlert({ kind, severity, title, message, snapshot }) {
+  const recent = get(
+    'SELECT id FROM business_alerts WHERE kind = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1',
+    [kind, Date.now() - ALERT_COOLDOWN_MS]
+  );
+  if (recent) return null;
+
+  const id = `alert_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  run(
+    'INSERT INTO business_alerts (id, kind, severity, title, message, snapshot_json, acknowledged, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      id,
+      kind,
+      severity,
+      title,
+      message,
+      JSON.stringify(snapshot),
+      0,
+      Date.now()
+    ]
+  );
+
+  const row = get('SELECT * FROM business_alerts WHERE id = ?', [id]);
+  broadcast('business:alert', row);
+  return row;
+}
+
+function evaluateBusinessAlerts(snapshot) {
+  const thresholds = getAlertThresholds();
+  const alerts = [];
+
+  if (snapshot.margin30 < thresholds.margin) {
+    const alert = createBusinessAlert({
+      kind: 'margin',
+      severity: snapshot.margin30 < thresholds.margin / 2 ? 'critical' : 'high',
+      title: 'Margin unter Zielkorridor',
+      message: `Aktuelle Marge ${(snapshot.margin30 * 100).toFixed(1)}% liegt unter dem Ziel ${(thresholds.margin * 100).toFixed(1)}%.`,
+      snapshot
+    });
+    if (alert) alerts.push(alert);
+  }
+
+  if (snapshot.runwayDays !== null && snapshot.runwayDays < thresholds.runwayDays) {
+    const alert = createBusinessAlert({
+      kind: 'runway',
+      severity: snapshot.runwayDays < thresholds.runwayDays / 2 ? 'critical' : 'high',
+      title: 'Runway-Risiko',
+      message: `Runway bei ${snapshot.runwayDays} Tagen (Schwelle: ${thresholds.runwayDays} Tage).`,
+      snapshot
+    });
+    if (alert) alerts.push(alert);
+  }
+
+  if (snapshot.criticalTasks > thresholds.criticalTasks) {
+    const alert = createBusinessAlert({
+      kind: 'critical_tasks',
+      severity: 'medium',
+      title: 'Operativer Engpass',
+      message: `Kritische offene Tasks: ${snapshot.criticalTasks} (Schwelle: ${thresholds.criticalTasks}).`,
+      snapshot
+    });
+    if (alert) alerts.push(alert);
+  }
+
+  return alerts;
+}
+
+function runEnterpriseIntelligenceCycle() {
+  const snapshot = getBusinessSnapshot();
+  const weekly = ensureWeeklyOpsTasks(snapshot);
+  const alerts = evaluateBusinessAlerts(snapshot);
+  if (weekly.created > 0 || alerts.length > 0) {
+    broadcast('business:cycle', {
+      ts: Date.now(),
+      weeklyTasksCreated: weekly.created,
+      alertsCreated: alerts.length
+    });
+  }
+  return { snapshot, weeklyTasksCreated: weekly.created, alertsCreated: alerts.length };
+}
 
 function evaluateArithmeticExpression(input) {
   const source = String(input || '').trim();
@@ -502,6 +671,195 @@ function evaluateArithmeticExpression(input) {
 
   if (stack.length !== 1 || !Number.isFinite(stack[0])) throw new Error('invalid expression');
   return Number(stack[0].toFixed(10));
+}
+
+function getBusinessSnapshot() {
+  const nowTs = Date.now();
+  const window30d = nowTs - 30 * 24 * 60 * 60 * 1000;
+
+  const tx30 = get(
+    'SELECT SUM(CASE WHEN type = "income" THEN amount ELSE 0 END) AS income, SUM(CASE WHEN type = "expense" THEN amount ELSE 0 END) AS expense FROM transactions WHERE created_at >= ?',
+    [window30d]
+  ) || { income: 0, expense: 0 };
+
+  const txAll = get(
+    'SELECT SUM(CASE WHEN type = "income" THEN amount ELSE 0 END) AS income, SUM(CASE WHEN type = "expense" THEN amount ELSE 0 END) AS expense FROM transactions'
+  ) || { income: 0, expense: 0 };
+
+  const openTasks = Number(get('SELECT COUNT(*) AS c FROM tasks WHERE done = 0')?.c || 0);
+  const criticalTasks = Number(
+    get('SELECT COUNT(*) AS c FROM tasks WHERE done = 0 AND priority = 1')?.c || 0
+  );
+  const orders30 = Number(get('SELECT COUNT(*) AS c FROM orders WHERE created_at >= ?', [window30d])?.c || 0);
+  const notes30 = Number(get('SELECT COUNT(*) AS c FROM notes WHERE created_at >= ?', [window30d])?.c || 0);
+
+  const topCategoryRow = get(
+    `SELECT p.category AS category, COUNT(o.id) AS c
+     FROM orders o
+     JOIN products p ON p.id = o.product_id
+     WHERE o.created_at >= ?
+     GROUP BY p.category
+     ORDER BY c DESC
+     LIMIT 1`,
+    [window30d]
+  );
+
+  const income30 = Number(tx30.income || 0);
+  const expense30 = Number(tx30.expense || 0);
+  const net30 = Number((income30 - expense30).toFixed(2));
+  const margin30 = income30 > 0 ? Number((net30 / income30).toFixed(4)) : 0;
+
+  const totalIncome = Number(txAll.income || 0);
+  const totalExpense = Number(txAll.expense || 0);
+  const balance = Number((totalIncome - totalExpense).toFixed(2));
+
+  const burnPerDay = Number((expense30 / 30).toFixed(2));
+  const runwayDays = burnPerDay > 0 ? Number((balance / burnPerDay).toFixed(1)) : null;
+  const efficiency = expense30 > 0 ? Number((income30 / expense30).toFixed(3)) : income30 > 0 ? 999 : 0;
+
+  return {
+    window: '30d',
+    revenue30: Number(income30.toFixed(2)),
+    cost30: Number(expense30.toFixed(2)),
+    net30,
+    margin30,
+    balance,
+    burnPerDay,
+    runwayDays,
+    efficiency,
+    openTasks,
+    criticalTasks,
+    orders30,
+    notes30,
+    topCategory: topCategoryRow?.category || 'n/a'
+  };
+}
+
+function scoreBusinessOption(option, snapshot, role = 'CEO') {
+  const text = String(option || '').toLowerCase();
+  let score = 50;
+  const reasons = [];
+
+  const growthTokens = ['preis', 'pricing', 'upsell', 'bundle', 'automation', 'automatis', 'vertrieb', 'sales', 'produkt', 'launch', 'conversion'];
+  const riskTokens = ['kredit', 'debt', 'hire', 'teamaufbau', 'pivot', 'rebrand', 'discount', 'rabatt'];
+  const focusTokens = ['profit', 'marge', 'margin', 'cash', 'kosten', 'cost', 'retention'];
+
+  const growthHit = growthTokens.some((t) => text.includes(t));
+  const riskHit = riskTokens.some((t) => text.includes(t));
+  const focusHit = focusTokens.some((t) => text.includes(t));
+
+  if (growthHit) {
+    score += 12;
+    reasons.push('Skalierbarer Growth-Hebel erkannt');
+  }
+  if (focusHit) {
+    score += 10;
+    reasons.push('Direkter Impact auf Unit Economics');
+  }
+  if (riskHit) {
+    score -= 9;
+    reasons.push('Erhoehtes Ausfuehrungs- oder Kapitalrisiko');
+  }
+
+  if (snapshot.margin30 < 0.15 && text.includes('kosten')) {
+    score += 8;
+    reasons.push('Aktuelle Marge spricht fuer Kostenhebel');
+  }
+  if (snapshot.criticalTasks > 8 && (text.includes('fokus') || text.includes('prior'))) {
+    score += 6;
+    reasons.push('Engpass bei operativer Priorisierung adressiert');
+  }
+  if (snapshot.runwayDays !== null && snapshot.runwayDays < 90 && (text.includes('cash') || text.includes('marge'))) {
+    score += 8;
+    reasons.push('Runway-Schutz kurzfristig verbessert');
+  }
+
+  if (role === 'CFO') {
+    if (text.includes('cash') || text.includes('marge') || text.includes('kosten') || text.includes('pricing')) {
+      score += 10;
+      reasons.push('CFO-Fit: Finanzhebel priorisiert');
+    }
+    if (text.includes('discount') || text.includes('rabatt')) {
+      score -= 6;
+      reasons.push('CFO-Risiko: Margendruck erkannt');
+    }
+  }
+
+  if (role === 'COO') {
+    if (text.includes('prozess') || text.includes('delivery') || text.includes('sla') || text.includes('durchlauf')) {
+      score += 10;
+      reasons.push('COO-Fit: Operative Exzellenz gefoerdert');
+    }
+    if (text.includes('pivot')) {
+      score -= 4;
+      reasons.push('COO-Risiko: Hohe Umsetzungsunsicherheit');
+    }
+  }
+
+  if (role === 'CEO') {
+    if (text.includes('wachstum') || text.includes('growth') || text.includes('markt') || text.includes('vertrieb')) {
+      score += 8;
+      reasons.push('CEO-Fit: Strategischer Wachstumseffekt');
+    }
+  }
+
+  return {
+    option,
+    score: Math.max(1, Math.min(100, Math.round(score))),
+    reasons: reasons.slice(0, 3)
+  };
+}
+
+function buildExecutionPlan(goal, horizonDays, snapshot, role = 'CEO') {
+  const g = String(goal || '').trim() || 'Profitabilitaet steigern';
+  const horizon = Number.isFinite(horizonDays) && horizonDays > 0 ? Math.min(90, Math.round(horizonDays)) : 14;
+
+  const templates = [
+    `KPI-Baseline fuer "${g}" aufsetzen (Owner + Zielwert + Deadline in ${Math.max(2, Math.round(horizon / 4))} Tagen)`,
+    `Top-3 Hebel fuer "${g}" priorisieren und 80/20-Fokusplan freigeben`,
+    `Woechentlichen Review-Rhythmus aktivieren (Revenue, Margin, Cash, Delivery)`
+  ];
+
+  if (role === 'CFO') {
+    templates.unshift(`Cash-Guardrail fuer "${g}" setzen (Burn-Limit, Freigabegrenzen, Reporting-Rhythmus)`);
+  } else if (role === 'COO') {
+    templates.unshift(`Delivery-Guardrail fuer "${g}" setzen (SLA, WIP-Limits, Engpassboard)`);
+  } else {
+    templates.unshift(`Strategisches Outcome fuer "${g}" schaerfen (Markt, Positionierung, Owner)`);
+  }
+
+  if (snapshot.margin30 < 0.2) {
+    templates.push('Marge verbessern: Preispunkte testen und unprofitable Kosten sofort reduzieren');
+  }
+  if (snapshot.criticalTasks > 5) {
+    templates.push('Operativen Backlog entlasten: kritische Tasks innerhalb 72h auf < 5 senken');
+  }
+  if (snapshot.orders30 < 10) {
+    templates.push('Pipeline-Hebel: Angebot + CTA + Follow-up-Sequenz fuer 10 neue Abschluesse vorbereiten');
+  }
+
+  return templates.slice(0, 5).map((title, i) => ({
+    title,
+    priority: i === 0 ? 1 : i < 3 ? 2 : 3
+  }));
+}
+
+function formatBusinessSnapshot(snapshot) {
+  const runway = snapshot.runwayDays === null ? 'n/a' : `${snapshot.runwayDays} days`;
+  return `
+BUSINESS SNAPSHOT (${snapshot.window})
+- Revenue: ${snapshot.revenue30} CHF
+- Cost: ${snapshot.cost30} CHF
+- Net: ${snapshot.net30} CHF
+- Margin: ${(snapshot.margin30 * 100).toFixed(1)}%
+- Balance: ${snapshot.balance} CHF
+- Burn/day: ${snapshot.burnPerDay} CHF
+- Runway: ${runway}
+- Efficiency (Revenue/Cost): ${snapshot.efficiency}
+- Open Tasks: ${snapshot.openTasks}
+- Critical Tasks: ${snapshot.criticalTasks}
+- Orders: ${snapshot.orders30}
+- Top Category: ${snapshot.topCategory}`;
 }
 
 function getCategoryPricing(category, fallbackPrice, fallbackCurrency) {
@@ -694,6 +1052,21 @@ async function processWebhookJobs() {
 }
 
 setInterval(processWebhookJobs, 5000);
+setInterval(() => {
+  try {
+    runEnterpriseIntelligenceCycle();
+  } catch (err) {
+    console.error('[EnterpriseCycle] Error:', err);
+  }
+}, ENTERPRISE_CYCLE_MS);
+
+setTimeout(() => {
+  try {
+    runEnterpriseIntelligenceCycle();
+  } catch (err) {
+    console.error('[EnterpriseCycle:init] Error:', err);
+  }
+}, 1500);
 
 function recordSale({ provider, amount, currency, productId, buyerEmail, providerRef }) {
   const id = `ord_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -1031,16 +1404,33 @@ app.post('/api/chat', async (req, reply) => {
 
   try {
     const context = getRecentContext && typeof getRecentContext === 'function' ? getRecentContext() : '';
+    const snapshot = getBusinessSnapshot();
+    const snapshotText = formatBusinessSnapshot(snapshot);
+    const executiveRole = getExecutiveRole();
+    const executiveDirective = getExecutiveRoleDirective(executiveRole);
 
     const model = genAI.getGenerativeModel({ 
       model: 'gemini-1.5-flash',
       // Dynamischer System-Prompt mit "Tools"
-      systemInstruction: `SYSTEM: Nexus "LogikX" v9 + MATHEMATIX Core.
-MODE: Hyper-Analytical.
+      systemInstruction: `SYSTEM: Nexus "LogikX" v9 + MATHEMATIX + EXECUTIVE OPS Core.
+    MODE: Hyper-Analytical + Business Operator.
+
+    BUSINESS ROLE:
+    Active profile: ${executiveRole}
+    ${executiveDirective}
+    Du agierst wie ein Geschaeftsoperator mit 20+ Jahren Praxis (CEO/CFO/COO-Denke).
+    Jede Empfehlung muss wirtschaftlich belastbar sein und sofort umsetzbar bleiben.
+
+    ANTWORT-RAHMEN (wenn sinnvoll):
+    1) Lagebild
+    2) Hebel (max 3)
+    3) Risiko
+    4) Naechster Schritt heute
 
 Du bist ein Hybrid aus AI und MATHEMATIX-Engine.
 1. SELF-LEARNING: Speichere User-Fakten & Variablen (z.B. "Steuersatz ist 19%").
 2. MATH: Rechne NICHT im Kopf. Nutze >> CALC: für ALLES Mathematische.
+    3. BUSINESS EXECUTION: Nutze datengetriebene Priorisierung, Cash-Fokus und Unit-Economics.
 
 COMMANDS:
 >> LISTEN: <Task> || <Prio>
@@ -1049,6 +1439,11 @@ COMMANDS:
 >> MERKX: <Fakt/Variable>
 >> VERGISS: <ID>
 >> CALC: <Math Expression> (z.B. 125 * 4.5)
+    >> KPI: <metric_name>
+    >> DECIDE: <Option A> || <Option B> [|| <Option C> ...]
+    >> PLAN: <Goal> || <HorizonDays>
+    >> ROLE: <CEO|CFO|COO>
+    >> ALERTS: <overview|ack_all>
 
 Beispiel:
 User: "Mein Stundensatz ist 150. Was verdiene ich in 8h?"
@@ -1057,7 +1452,8 @@ Du: Ich speichere den Satz und berechne den Tagessatz.
 >> CALC: 150 * 8
 
 KONTEXT-STREAM:
-${context}`
+${context}
+${snapshotText}`
     });
 
     const chat = model.startChat({
@@ -1087,6 +1483,88 @@ ${context}`
           finalLines.push(`🧮 *Mathematix:* ${String(expr).trim()} = **${resultValue}**`);
         } catch (e) {
           finalLines.push(`⚠️ *Calc Error:* ${expr}`);
+        }
+      } else if (line.includes('>> KPI:')) {
+        const [_, metricRaw] = line.split('>> KPI:');
+        const metric = String(metricRaw || '').trim().toLowerCase();
+        const kpi = getBusinessSnapshot();
+
+        if (!metric || metric === 'all' || metric === 'overview') {
+          finalLines.push(`📊 *KPI Overview:* Revenue ${kpi.revenue30} CHF | Cost ${kpi.cost30} CHF | Net ${kpi.net30} CHF | Margin ${(kpi.margin30 * 100).toFixed(1)}% | Balance ${kpi.balance} CHF | Runway ${kpi.runwayDays ?? 'n/a'} days`);
+        } else if (metric.includes('margin')) {
+          finalLines.push(`📈 *KPI Margin:* ${(kpi.margin30 * 100).toFixed(1)}%`);
+        } else if (metric.includes('revenue') || metric.includes('umsatz')) {
+          finalLines.push(`💵 *KPI Revenue (30d):* ${kpi.revenue30} CHF`);
+        } else if (metric.includes('cost') || metric.includes('kosten')) {
+          finalLines.push(`💸 *KPI Cost (30d):* ${kpi.cost30} CHF`);
+        } else if (metric.includes('runway')) {
+          finalLines.push(`⛽ *KPI Runway:* ${kpi.runwayDays ?? 'n/a'} days`);
+        } else {
+          finalLines.push(`ℹ️ *KPI:* Unbekannte Kennzahl "${metricRaw}". Nutze z.B. overview, margin, revenue, cost, runway.`);
+        }
+      } else if (line.includes('>> DECIDE:')) {
+        const [_, payload] = line.split('>> DECIDE:');
+        const options = String(payload || '')
+          .split('||')
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .slice(0, 6);
+
+        if (options.length < 2) {
+          finalLines.push('⚠️ *Decision:* Mindestens zwei Optionen benoetigt.');
+        } else {
+          const activeRole = getExecutiveRole();
+          const ranked = options
+            .map((opt) => scoreBusinessOption(opt, snapshot, activeRole))
+            .sort((a, b) => b.score - a.score);
+          const winner = ranked[0];
+          finalLines.push(`🎯 *Decision (${activeRole}):* Prioritaet -> **${winner.option}** (Score ${winner.score}/100)`);
+          if (winner.reasons.length) finalLines.push(`   Grund: ${winner.reasons.join(' | ')}`);
+        }
+      } else if (line.includes('>> PLAN:')) {
+        const [_, payload] = line.split('>> PLAN:');
+        const [goalRaw, horizonRaw] = String(payload || '').split('||').map((s) => s.trim());
+        const horizonDays = Number(horizonRaw || 14);
+        const activeRole = getExecutiveRole();
+        const plan = buildExecutionPlan(goalRaw, horizonDays, snapshot, activeRole);
+
+        for (const step of plan) {
+          const id = `task_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+          run('INSERT INTO tasks (id, title, done, priority, created_at) VALUES (?, ?, ?, ?, ?)', [
+            id,
+            step.title,
+            0,
+            Number(step.priority) || 2,
+            Date.now()
+          ]);
+          const row = get('SELECT * FROM tasks WHERE id=?', [id]);
+          broadcast('task:created', row);
+        }
+
+        finalLines.push(`🧭 *Plan erstellt (${activeRole}):* ${plan.length} Aufgaben fuer "${goalRaw || 'Business-Ziel'}" angelegt.`);
+      } else if (line.includes('>> ROLE:')) {
+        const [_, roleRaw] = line.split('>> ROLE:');
+        const nextRole = setExecutiveRole(roleRaw);
+        finalLines.push(`🧠 *Executive-Profil gesetzt:* ${nextRole}`);
+      } else if (line.includes('>> ALERTS:')) {
+        const [_, actionRaw] = line.split('>> ALERTS:');
+        const action = String(actionRaw || '').trim().toLowerCase();
+
+        if (action === 'ack_all') {
+          run('UPDATE business_alerts SET acknowledged = 1 WHERE acknowledged = 0');
+          finalLines.push('✅ *Alerts:* Alle offenen Alerts wurden bestaetigt.');
+        } else {
+          const list = all(
+            'SELECT severity, title, message, created_at FROM business_alerts WHERE acknowledged = 0 ORDER BY created_at DESC LIMIT 5'
+          );
+          if (!list.length) {
+            finalLines.push('🟢 *Alerts:* Keine offenen KPI-Warnungen.');
+          } else {
+            finalLines.push(`🚨 *Alerts (${list.length} offen):*`);
+            for (const item of list) {
+              finalLines.push(`- [${String(item.severity).toUpperCase()}] ${item.title}: ${item.message}`);
+            }
+          }
         }
       } else if (line.includes('>> LÖSCHEN:')) {
          const [_, id] = line.split('>> LÖSCHEN:');
@@ -1154,6 +1632,66 @@ app.get('/api/metrics', async () => {
     totalSpentCHF: Number(spent.toFixed(2)),
     dailyBudgetCHF: budget
   };
+});
+
+app.get('/api/business/snapshot', async () => {
+  return getBusinessSnapshot();
+});
+
+app.get('/api/business/role', async () => ({
+  role: getExecutiveRole(),
+  directive: getExecutiveRoleDirective(getExecutiveRole())
+}));
+
+app.put('/api/business/role', async (req, reply) => {
+  const { role } = req.body ?? {};
+  if (!role) return reply.code(400).send({ error: 'role required (CEO|CFO|COO)' });
+  const nextRole = setExecutiveRole(role);
+  return { role: nextRole, directive: getExecutiveRoleDirective(nextRole) };
+});
+
+app.get('/api/business/thresholds', async () => getAlertThresholds());
+
+app.put('/api/business/thresholds', async (req, reply) => {
+  const { margin, runwayDays, criticalTasks } = req.body ?? {};
+
+  const nextMargin = Number.isFinite(Number(margin)) ? Number(margin) : getAlertThresholds().margin;
+  const nextRunway = Number.isFinite(Number(runwayDays)) ? Number(runwayDays) : getAlertThresholds().runwayDays;
+  const nextCritical = Number.isFinite(Number(criticalTasks)) ? Number(criticalTasks) : getAlertThresholds().criticalTasks;
+
+  const upsert = (key, value) => {
+    const existing = get('SELECT value FROM global_settings WHERE key = ?', [key]);
+    if (existing) run('UPDATE global_settings SET value = ? WHERE key = ?', [String(value), key]);
+    else run('INSERT INTO global_settings (key, value) VALUES (?, ?)', [key, String(value)]);
+  };
+
+  upsert('alert_margin_threshold', nextMargin);
+  upsert('alert_runway_days_threshold', nextRunway);
+  upsert('alert_critical_tasks_threshold', nextCritical);
+
+  return getAlertThresholds();
+});
+
+app.get('/api/business/alerts', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 30);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, limitRaw)) : 30;
+  return all('SELECT * FROM business_alerts ORDER BY created_at DESC LIMIT ?', [limit]);
+});
+
+app.post('/api/business/alerts/evaluate', async () => {
+  const result = runEnterpriseIntelligenceCycle();
+  return result;
+});
+
+app.post('/api/business/alerts/ack_all', async () => {
+  run('UPDATE business_alerts SET acknowledged = 1 WHERE acknowledged = 0');
+  return { ok: true };
+});
+
+app.post('/api/business/weekly/review', async () => {
+  const snapshot = getBusinessSnapshot();
+  const result = ensureWeeklyOpsTasks(snapshot);
+  return result;
 });
 
 app.post('/api/settings/budget', async (req, reply) => {
