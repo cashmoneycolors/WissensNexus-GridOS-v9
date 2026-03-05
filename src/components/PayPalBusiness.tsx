@@ -152,6 +152,47 @@ type FollowupSettings = {
   maxTouchpoints: number;
 };
 
+type PortfolioRankRow = {
+  category: string;
+  score: number;
+  band: string;
+  revenue: number;
+  orders: number;
+  conversion: number;
+  productsCreated: number;
+  listedPrice: number;
+};
+
+type Allocation = {
+  category: string;
+  band: string;
+  score: number;
+  amount: number;
+};
+
+type BudgetAllocationModel = {
+  totalBudget: number;
+  allocations: Allocation[];
+  rationale: string;
+  createdAt?: number;
+};
+
+type SimulationScenario = {
+  days: number;
+  assumptions: {
+    priceDeltaPct: number;
+    conversionDeltaPct: number;
+    costDeltaPct: number;
+    growthBias: number;
+  };
+  projection: {
+    revenue: number;
+    cost: number;
+    net: number;
+    margin: number;
+  };
+};
+
 export default function PayPalBusiness() {
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [transactions, setTransactions] = useState<Tx[]>([]);
@@ -173,6 +214,10 @@ export default function PayPalBusiness() {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [followups, setFollowups] = useState<FollowupAction[]>([]);
   const [followupSettings, setFollowupSettings] = useState<FollowupSettings>({ enabled: true, intervalHours: 48, maxTouchpoints: 5 });
+  const [portfolioRanking, setPortfolioRanking] = useState<PortfolioRankRow[]>([]);
+  const [allocationPreview, setAllocationPreview] = useState<BudgetAllocationModel>({ totalBudget: 0, allocations: [], rationale: '' });
+  const [allocationLatest, setAllocationLatest] = useState<BudgetAllocationModel | null>(null);
+  const [simulationScenarios, setSimulationScenarios] = useState<SimulationScenario[]>([]);
   const [leadEmail, setLeadEmail] = useState('');
   const [leadName, setLeadName] = useState('');
   const [leadSource, setLeadSource] = useState('manual');
@@ -199,7 +244,11 @@ export default function PayPalBusiness() {
       pricingRows,
       leadRows,
       followRows,
-      followSettings
+      followSettings,
+      rankRows,
+      allocPreview,
+      allocLatest,
+      simDefault
     ] = await Promise.all([
       apiGet<Invoice[]>('/api/invoices'),
       apiGet<Tx[]>('/api/transactions'),
@@ -216,7 +265,11 @@ export default function PayPalBusiness() {
       apiGet<PricingAction[]>('/api/business/pricing/actions?limit=8'),
       apiGet<Lead[]>('/api/business/leads'),
       apiGet<FollowupAction[]>('/api/business/followups?limit=12'),
-      apiGet<FollowupSettings>('/api/business/followups/settings')
+      apiGet<FollowupSettings>('/api/business/followups/settings'),
+      apiGet<{ ranking: PortfolioRankRow[] }>('/api/business/portfolio/rank'),
+      apiGet<BudgetAllocationModel>('/api/business/budget/allocation'),
+      apiGet<BudgetAllocationModel>('/api/business/budget/allocation/latest').catch(() => ({ totalBudget: 0, allocations: [], rationale: '' })),
+      apiGet<{ scenarios: SimulationScenario[] }>('/api/business/simulate/default')
     ]);
     setInvoices(inv);
     setTransactions(tx);
@@ -234,6 +287,10 @@ export default function PayPalBusiness() {
     setLeads(leadRows);
     setFollowups(Array.isArray(followRows) ? followRows : followRows ? [followRows] : []);
     setFollowupSettings(followSettings);
+    setPortfolioRanking(rankRows?.ranking || []);
+    setAllocationPreview(allocPreview);
+    setAllocationLatest(allocLatest);
+    setSimulationScenarios(simDefault?.scenarios || []);
   };
 
   useEffect(() => {
@@ -415,6 +472,26 @@ export default function PayPalBusiness() {
     }
   };
 
+  const applyBudgetAllocation = async () => {
+    setOpsBusy(true);
+    try {
+      await apiSend('/api/business/budget/allocation/apply', 'POST', { budget: allocationPreview.totalBudget });
+      await loadAll();
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const refreshSimulation = async () => {
+    setOpsBusy(true);
+    try {
+      const sim = await apiGet<{ scenarios: SimulationScenario[] }>('/api/business/simulate/default');
+      setSimulationScenarios(sim.scenarios || []);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
   return (
     <ViewLayout title="PayPal Business Hub" subtitle="Live Checkout & Download Delivery.">
       <div className="grid gap-3 lg:grid-cols-[1fr,360px] h-full">
@@ -555,6 +632,48 @@ export default function PayPalBusiness() {
                   {pricingActions.length === 0 && <div className="text-xs text-slate-500">Noch keine Preis-Aenderungen.</div>}
                 </div>
               </div>
+            </div>
+
+            <div className="mt-3 rounded-xl border border-slate-800/80 bg-slate-950/30 p-3">
+              <div className="text-xs text-slate-400 mb-2">Stage 5: Portfolio Ranker + Budget Allocation + 30/60/90 Simulation</div>
+
+              <div className="grid gap-2 sm:grid-cols-3">
+                <div className="space-y-1">
+                  <div className="text-[11px] font-bold text-slate-300">Top Kategorien</div>
+                  {portfolioRanking.slice(0, 3).map((r) => (
+                    <div key={r.category} className="text-xs rounded border border-slate-700 bg-black/30 px-2 py-1">
+                      {r.category} · Score {r.score.toFixed(1)} · {(r.conversion * 100).toFixed(2)}%
+                    </div>
+                  ))}
+                  {portfolioRanking.length === 0 && <div className="text-xs text-slate-500">Noch kein Ranking.</div>}
+                </div>
+
+                <div className="space-y-1">
+                  <div className="text-[11px] font-bold text-slate-300">Budget Preview ({allocationPreview.totalBudget.toFixed(2)} CHF)</div>
+                  {allocationPreview.allocations.slice(0, 4).map((a) => (
+                    <div key={a.category} className="text-xs rounded border border-slate-700 bg-black/30 px-2 py-1">
+                      {a.category}: {a.amount.toFixed(2)} CHF
+                    </div>
+                  ))}
+                  <Button className="mt-1" onClick={applyBudgetAllocation} disabled={opsBusy}>Apply Allocation</Button>
+                </div>
+
+                <div className="space-y-1">
+                  <div className="text-[11px] font-bold text-slate-300">Simulation 30/60/90</div>
+                  {simulationScenarios.map((s) => (
+                    <div key={s.days} className="text-xs rounded border border-slate-700 bg-black/30 px-2 py-1">
+                      {s.days}d: Net {s.projection.net.toFixed(2)} CHF · Margin {(s.projection.margin * 100).toFixed(1)}%
+                    </div>
+                  ))}
+                  <Button variant="ghost" className="mt-1" onClick={refreshSimulation} disabled={opsBusy}>Refresh Simulation</Button>
+                </div>
+              </div>
+
+              {allocationLatest?.createdAt && (
+                <div className="mt-2 text-[11px] text-slate-500">
+                  Last allocation: {new Date(allocationLatest.createdAt).toLocaleString()}
+                </div>
+              )}
             </div>
           </Card>
 
