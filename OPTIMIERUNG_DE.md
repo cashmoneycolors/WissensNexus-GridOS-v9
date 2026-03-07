@@ -440,6 +440,50 @@ Nutzen:
 - Replay bleibt auch bei Incident-Last kontrolliert und fair
 - Tagesberichte sind sofort fuer Review/Audit exportierbar
 
+## 20) Stufe 11: Adaptive Thresholds + Anomaly Detection + Playbooks
+
+Datei: `server/index.mjs`, `src/components/Dashboard.tsx`
+
+Umgesetzt:
+
+- Adaptive Ops-Thresholds
+  - Neue Runtime-Settings fuer adaptives Monitoring:
+    - `enabled`
+    - `lookbackSnapshots`
+    - `sensitivity`
+    - `minBaselineSamples`
+  - Effektive Schwellwerte werden aus Historie + Sensitivitaet berechnet (mit festen Mindest-Schwellen als Guardrail)
+  - Neue APIs:
+    - `GET /api/ops/adaptive`
+    - `PUT /api/ops/adaptive`
+- Anomaly Detection auf Multi-Metrik-Basis
+  - Z-Score/Fallback-basierte Abweichungserkennung fuer:
+    - Pending Jobs
+    - Failed Jobs
+    - p95 Latenz
+    - Error-Rate
+  - Bei Cluster-Abweichung wird ein dedizierter Alert erzeugt:
+    - `kind=ops_anomaly_cluster`
+  - Backpressure-API liefert Anomaly-Status live im Dashboard
+- Auto-Remediation Playbooks (konfigurierbar)
+  - Neue Playbook-Settings inkl. APIs:
+    - `GET /api/ops/playbooks`
+    - `PUT /api/ops/playbooks`
+  - Aktionen je nach Incident:
+    - Queue-Stress: Replay-Batch adaptiv reduzieren
+    - Latenz/Error-Stress: Replay-Backoff haerten
+    - Anomaly-Cluster: Replay-Fenster kurz pausieren (pending Jobs verschieben)
+  - Optional "critical only" und "allow on anomaly"
+- Dashboard Stage-11 Controls
+  - Adaptive- und Playbook-Settings direkt editierbar
+  - Sichtbar: aktueller Threshold-Mode (`fixed|adaptive`) + Live-Anomaly-Zustand
+
+Nutzen:
+
+- Alerting reagiert auf echte Muster statt nur auf starre Grenzwerte
+- Incident-Reaktion wird automatisiert, aber kontrollierbar
+- Team kann Sensitivitaet und Remediation ohne Code-Redeploy steuern
+
 ## Bekannte Folgeaenderung
 
 Datei: `server/data.sqlite`
@@ -456,6 +500,6 @@ Datei: `server/data.sqlite`
 ## Nächste Optimierungsstufe (optional)
 
 1. Replay-Rate-Limiter von In-Memory auf persistente/verteilte Counter erweitern.
-2. Auto-Action-Playbooks pro Alert-Typ (mehr als Backoff/Batch-Adjustments).
+2. Playbook-Orchestrierung mit mehrstufigen Runbooks (inkl. Rollback/Timeout-Guards).
 3. PayPal-Sandbox/Live-Umschaltung fuer native Verify-API per Runtime-Setting.
 4. Geplante Report-Distribution (taeglicher Versand via SMTP/Webhook).

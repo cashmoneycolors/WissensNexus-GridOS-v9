@@ -62,6 +62,11 @@ type BackpressureSnapshot = {
     batchSize: number;
   };
   opsThresholds?: OpsThresholds;
+  opsThresholdsStatic?: OpsThresholds;
+  opsThresholdMode?: 'fixed' | 'adaptive';
+  opsAdaptive?: OpsAdaptiveSettings;
+  opsPlaybooks?: OpsPlaybookSettings;
+  anomaly?: AnomalyState;
 };
 
 type OpsHistoryRow = {
@@ -97,6 +102,28 @@ type ReplayRateLimit = {
   perMinute: number;
 };
 
+type OpsAdaptiveSettings = {
+  enabled: boolean;
+  lookbackSnapshots: number;
+  sensitivity: number;
+  minBaselineSamples: number;
+};
+
+type OpsPlaybookSettings = {
+  enabled: boolean;
+  criticalOnly: boolean;
+  allowOnAnomaly: boolean;
+  queueBatchReductionPct: number;
+  latencyBackoffFloorMs: number;
+  anomalyReplayPauseMs: number;
+};
+
+type AnomalyState = {
+  detected: boolean;
+  severity?: string;
+  maxZ?: number;
+};
+
 type DailyReport = {
   date: string;
   summary: {
@@ -129,6 +156,9 @@ export default function Dashboard({ metrics }: Props) {
   const [opsHistory, setOpsHistory] = useState<OpsHistoryRow[]>([]);
   const [opsAlerts, setOpsAlerts] = useState<OpsAlertRow[]>([]);
   const [opsThresholds, setOpsThresholds] = useState<OpsThresholds>({ pendingJobs: 60, failedJobs: 5, p95LatencyMs: 700, errorRate: 0.05 });
+  const [opsThresholdMode, setOpsThresholdMode] = useState<'fixed' | 'adaptive'>('fixed');
+  const [opsAdaptive, setOpsAdaptive] = useState<OpsAdaptiveSettings>({ enabled: true, lookbackSnapshots: 60, sensitivity: 2.2, minBaselineSamples: 20 });
+  const [opsPlaybooks, setOpsPlaybooks] = useState<OpsPlaybookSettings>({ enabled: true, criticalOnly: true, allowOnAnomaly: true, queueBatchReductionPct: 0.35, latencyBackoffFloorMs: 10000, anomalyReplayPauseMs: 30000 });
   const [replayRateLimit, setReplayRateLimit] = useState<ReplayRateLimit>({ perMinute: 30 });
   const [dailyReport, setDailyReport] = useState<DailyReport | null>(null);
   const [reportDate, setReportDate] = useState('');
@@ -156,6 +186,9 @@ export default function Dashboard({ metrics }: Props) {
         .then((bp) => {
           setOps(bp);
           if (bp?.opsThresholds) setOpsThresholds(bp.opsThresholds);
+          if (bp?.opsThresholdMode) setOpsThresholdMode(bp.opsThresholdMode);
+          if (bp?.opsAdaptive) setOpsAdaptive(bp.opsAdaptive);
+          if (bp?.opsPlaybooks) setOpsPlaybooks(bp.opsPlaybooks);
           if (bp?.replayPolicy?.batchSize && !Number.isFinite(replayBatchSize)) {
             setReplayBatchSize(bp.replayPolicy.batchSize);
           }
@@ -277,6 +310,32 @@ export default function Dashboard({ metrics }: Props) {
     try {
       const next = await apiSend<ReplayRateLimit>('/api/webhooks/replay_rate_limit', 'PUT', replayRateLimit);
       setReplayRateLimit(next);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const saveOpsAdaptive = async () => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      const next = await apiSend<OpsAdaptiveSettings>('/api/ops/adaptive', 'PUT', opsAdaptive);
+      setOpsAdaptive(next);
+      const bp = await apiGet<BackpressureSnapshot>('/api/ops/backpressure');
+      setOps(bp);
+      if (bp?.opsThresholds) setOpsThresholds(bp.opsThresholds);
+      if (bp?.opsThresholdMode) setOpsThresholdMode(bp.opsThresholdMode);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const saveOpsPlaybooks = async () => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      const next = await apiSend<OpsPlaybookSettings>('/api/ops/playbooks', 'PUT', opsPlaybooks);
+      setOpsPlaybooks(next);
     } finally {
       setOpsBusy(false);
     }
@@ -466,6 +525,16 @@ export default function Dashboard({ metrics }: Props) {
 
         <Card className="p-4 sm:col-span-2 lg:col-span-3">
           <div className="text-xs font-semibold text-slate-400">Ops Backpressure Heat Panel</div>
+          <div className="mt-1 text-xs text-slate-500">
+            Threshold Mode: <span className="font-semibold text-slate-300">{opsThresholdMode}</span>
+            {ops?.anomaly?.detected ? (
+              <span className="ml-2 rounded border border-rose-500/40 bg-rose-950/20 px-1.5 py-0.5 text-rose-300">
+                anomaly z={Number(ops.anomaly.maxZ || 0).toFixed(2)}
+              </span>
+            ) : (
+              <span className="ml-2 rounded border border-emerald-500/30 bg-emerald-950/20 px-1.5 py-0.5 text-emerald-300">stable</span>
+            )}
+          </div>
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <div className="rounded border border-slate-800/80 bg-slate-950/30 p-3">
               <div className="flex items-center justify-between text-xs">
@@ -636,6 +705,119 @@ export default function Dashboard({ metrics }: Props) {
             <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
               <div className="text-slate-500">Ops Alerts</div>
               <div className="font-bold text-slate-100">{dailyReport?.summary.alertsCount ?? 0}</div>
+            </div>
+          </div>
+        </Card>
+
+        <Card className="p-4 sm:col-span-2 lg:col-span-3">
+          <div className="text-xs font-semibold text-slate-400">Stage 11: Adaptive Ops + Playbooks</div>
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-3">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-semibold text-slate-300">Adaptive Thresholds</div>
+                <label className="flex items-center gap-2 text-xs text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={opsAdaptive.enabled}
+                    onChange={(e) => setOpsAdaptive((p) => ({ ...p, enabled: e.target.checked }))}
+                  />
+                  enabled
+                </label>
+              </div>
+              <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+                <input
+                  type="number"
+                  min={20}
+                  max={500}
+                  value={opsAdaptive.lookbackSnapshots}
+                  onChange={(e) => setOpsAdaptive((p) => ({ ...p, lookbackSnapshots: Number(e.target.value || 60) }))}
+                  aria-label="Adaptive lookback snapshots"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
+                <input
+                  type="number"
+                  step="0.1"
+                  min={1.2}
+                  max={4}
+                  value={opsAdaptive.sensitivity}
+                  onChange={(e) => setOpsAdaptive((p) => ({ ...p, sensitivity: Number(e.target.value || 2.2) }))}
+                  aria-label="Adaptive sensitivity"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
+                <input
+                  type="number"
+                  min={10}
+                  max={80}
+                  value={opsAdaptive.minBaselineSamples}
+                  onChange={(e) => setOpsAdaptive((p) => ({ ...p, minBaselineSamples: Number(e.target.value || 20) }))}
+                  aria-label="Adaptive minimum baseline samples"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
+              </div>
+              <Button className="mt-2 text-xs" onClick={saveOpsAdaptive} disabled={opsBusy}>Save Adaptive</Button>
+            </div>
+
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-3">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-semibold text-slate-300">Auto-Remediation Playbooks</div>
+                <label className="flex items-center gap-2 text-xs text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={opsPlaybooks.enabled}
+                    onChange={(e) => setOpsPlaybooks((p) => ({ ...p, enabled: e.target.checked }))}
+                  />
+                  enabled
+                </label>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-300">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={opsPlaybooks.criticalOnly}
+                    onChange={(e) => setOpsPlaybooks((p) => ({ ...p, criticalOnly: e.target.checked }))}
+                  />
+                  critical only
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={opsPlaybooks.allowOnAnomaly}
+                    onChange={(e) => setOpsPlaybooks((p) => ({ ...p, allowOnAnomaly: e.target.checked }))}
+                  />
+                  anomaly actions
+                </label>
+              </div>
+              <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+                <input
+                  type="number"
+                  step="0.01"
+                  min={0.1}
+                  max={0.8}
+                  value={opsPlaybooks.queueBatchReductionPct}
+                  onChange={(e) => setOpsPlaybooks((p) => ({ ...p, queueBatchReductionPct: Number(e.target.value || 0.35) }))}
+                  aria-label="Queue batch reduction percent"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
+                <input
+                  type="number"
+                  min={2000}
+                  max={120000}
+                  value={opsPlaybooks.latencyBackoffFloorMs}
+                  onChange={(e) => setOpsPlaybooks((p) => ({ ...p, latencyBackoffFloorMs: Number(e.target.value || 10000) }))}
+                  aria-label="Latency backoff floor ms"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
+                <input
+                  type="number"
+                  min={5000}
+                  max={600000}
+                  value={opsPlaybooks.anomalyReplayPauseMs}
+                  onChange={(e) => setOpsPlaybooks((p) => ({ ...p, anomalyReplayPauseMs: Number(e.target.value || 30000) }))}
+                  aria-label="Anomaly replay pause ms"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
+              </div>
+              <Button className="mt-2 text-xs" onClick={saveOpsPlaybooks} disabled={opsBusy}>Save Playbooks</Button>
             </div>
           </div>
         </Card>

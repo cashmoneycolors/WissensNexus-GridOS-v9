@@ -502,6 +502,7 @@ const ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const PAYPAL_WEBHOOK_ID = String(process.env.PAYPAL_WEBHOOK_ID || '');
 const PAYPAL_API_BASE = String(process.env.PAYPAL_API_BASE || 'https://api-m.paypal.com');
 const OPS_ALERT_COOLDOWN_MS = Number(process.env.OPS_ALERT_COOLDOWN_MS || 30 * 60 * 1000);
+const OPS_ANOMALY_ALERT_COOLDOWN_MS = Number(process.env.OPS_ANOMALY_ALERT_COOLDOWN_MS || 20 * 60 * 1000);
 const REPLAY_RATE_LIMIT_DEFAULT_PER_MIN = Number(process.env.REPLAY_RATE_LIMIT_PER_MIN || 30);
 const OPS_REPORTS_DIR = path.join(CONTENT_DIR, 'ops_reports');
 
@@ -1540,6 +1541,159 @@ function getOpsAlertThresholds() {
   };
 }
 
+function getOpsAdaptiveSettings() {
+  const enabled = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_adaptive_enabled'])?.value || 1) === 1;
+  const lookbackSnapshots = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_adaptive_lookback'])?.value || 60);
+  const sensitivity = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_adaptive_sensitivity'])?.value || 2.2);
+  const minBaselineSamples = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_adaptive_min_samples'])?.value || 20);
+
+  return {
+    enabled,
+    lookbackSnapshots: Number.isFinite(lookbackSnapshots) ? Math.max(20, Math.min(500, Math.round(lookbackSnapshots))) : 60,
+    sensitivity: Number.isFinite(sensitivity) ? Math.max(1.2, Math.min(4, Number(sensitivity))) : 2.2,
+    minBaselineSamples: Number.isFinite(minBaselineSamples) ? Math.max(10, Math.min(80, Math.round(minBaselineSamples))) : 20
+  };
+}
+
+function getOpsPlaybookSettings() {
+  const enabled = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbooks_enabled'])?.value || 1) === 1;
+  const criticalOnly = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbooks_critical_only'])?.value || 1) === 1;
+  const allowOnAnomaly = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbooks_allow_anomaly'])?.value || 1) === 1;
+  const queueBatchReductionPct = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_queue_batch_reduction_pct'])?.value || 0.35);
+  const latencyBackoffFloorMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_latency_backoff_floor_ms'])?.value || 10000);
+  const anomalyReplayPauseMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_anomaly_replay_pause_ms'])?.value || 30000);
+
+  return {
+    enabled,
+    criticalOnly,
+    allowOnAnomaly,
+    queueBatchReductionPct: Number.isFinite(queueBatchReductionPct) ? Math.max(0.1, Math.min(0.8, Number(queueBatchReductionPct))) : 0.35,
+    latencyBackoffFloorMs: Number.isFinite(latencyBackoffFloorMs) ? Math.max(2000, Math.min(120000, Math.round(latencyBackoffFloorMs))) : 10000,
+    anomalyReplayPauseMs: Number.isFinite(anomalyReplayPauseMs) ? Math.max(5000, Math.min(600000, Math.round(anomalyReplayPauseMs))) : 30000
+  };
+}
+
+function average(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((sum, v) => sum + Number(v || 0), 0) / arr.length;
+}
+
+function stddev(arr, mean) {
+  if (arr.length < 2) return 0;
+  const variance = arr.reduce((sum, v) => {
+    const diff = Number(v || 0) - mean;
+    return sum + diff * diff;
+  }, 0) / arr.length;
+  return Math.sqrt(Math.max(0, variance));
+}
+
+function buildOpsBaseline(lookbackSnapshots = 60) {
+  const rows = all(
+    'SELECT pending_jobs, failed_jobs, p95_latency_ms, error_rate FROM ops_history ORDER BY created_at DESC LIMIT ?',
+    [Math.max(20, Math.min(500, Math.round(Number(lookbackSnapshots) || 60)))]
+  );
+
+  if (!rows.length) return null;
+
+  const pending = rows.map((r) => Number(r.pending_jobs || 0));
+  const failed = rows.map((r) => Number(r.failed_jobs || 0));
+  const p95 = rows.map((r) => Number(r.p95_latency_ms || 0));
+  const err = rows.map((r) => Number(r.error_rate || 0));
+
+  const pendingMean = average(pending);
+  const failedMean = average(failed);
+  const p95Mean = average(p95);
+  const errMean = average(err);
+
+  return {
+    samples: rows.length,
+    pendingJobs: { mean: pendingMean, std: stddev(pending, pendingMean) },
+    failedJobs: { mean: failedMean, std: stddev(failed, failedMean) },
+    p95LatencyMs: { mean: p95Mean, std: stddev(p95, p95Mean) },
+    errorRate: { mean: errMean, std: stddev(err, errMean) }
+  };
+}
+
+function getEffectiveOpsThresholds(snapshot, baseline = null) {
+  const fixed = getOpsAlertThresholds();
+  const adaptive = getOpsAdaptiveSettings();
+
+  if (!adaptive.enabled || !baseline || baseline.samples < adaptive.minBaselineSamples) {
+    return {
+      mode: 'fixed',
+      baselineSamples: Number(baseline?.samples || 0),
+      static: fixed,
+      effective: fixed,
+      adaptiveSettings: adaptive
+    };
+  }
+
+  const k = adaptive.sensitivity;
+  const dynPending = Math.round(baseline.pendingJobs.mean + k * baseline.pendingJobs.std);
+  const dynFailed = Math.round(baseline.failedJobs.mean + k * baseline.failedJobs.std);
+  const dynP95 = Math.round(baseline.p95LatencyMs.mean + k * baseline.p95LatencyMs.std);
+  const dynErr = Number((baseline.errorRate.mean + k * baseline.errorRate.std).toFixed(4));
+
+  const effective = {
+    pendingJobs: Math.max(fixed.pendingJobs, Number.isFinite(dynPending) ? dynPending : fixed.pendingJobs),
+    failedJobs: Math.max(fixed.failedJobs, Number.isFinite(dynFailed) ? dynFailed : fixed.failedJobs),
+    p95LatencyMs: Math.max(fixed.p95LatencyMs, Number.isFinite(dynP95) ? dynP95 : fixed.p95LatencyMs),
+    errorRate: Math.max(fixed.errorRate, Number.isFinite(dynErr) ? Math.min(1, dynErr) : fixed.errorRate)
+  };
+
+  return {
+    mode: 'adaptive',
+    baselineSamples: baseline.samples,
+    static: fixed,
+    effective,
+    adaptiveSettings: adaptive,
+    baseline
+  };
+}
+
+function buildAnomalySignal(current, baselineBucket, sensitivity) {
+  if (!baselineBucket) return { z: 0, threshold: 0, over: false };
+  const mean = Number(baselineBucket.mean || 0);
+  const std = Number(baselineBucket.std || 0);
+  const fallbackSpread = Math.max(1, Math.abs(mean) * 0.2);
+  const denom = std > 0 ? std : fallbackSpread;
+  const z = denom > 0 ? (Number(current || 0) - mean) / denom : 0;
+  const threshold = sensitivity + 0.6;
+  return { z: Number(z.toFixed(3)), threshold, over: z >= threshold };
+}
+
+function detectOpsAnomaly(snapshot, baseline, adaptiveSettings) {
+  if (!baseline || !adaptiveSettings?.enabled || baseline.samples < adaptiveSettings.minBaselineSamples) {
+    return null;
+  }
+
+  const pendingSignal = buildAnomalySignal(snapshot.pendingJobs, baseline.pendingJobs, adaptiveSettings.sensitivity);
+  const failedSignal = buildAnomalySignal(snapshot.failedJobs, baseline.failedJobs, adaptiveSettings.sensitivity);
+  const p95Signal = buildAnomalySignal(snapshot.p95LatencyMs, baseline.p95LatencyMs, adaptiveSettings.sensitivity);
+  const errSignal = buildAnomalySignal(snapshot.errorRate, baseline.errorRate, adaptiveSettings.sensitivity);
+
+  const signals = [
+    { key: 'pendingJobs', ...pendingSignal },
+    { key: 'failedJobs', ...failedSignal },
+    { key: 'p95LatencyMs', ...p95Signal },
+    { key: 'errorRate', ...errSignal }
+  ];
+
+  const hot = signals.filter((s) => s.over);
+  const maxZ = signals.reduce((m, s) => Math.max(m, s.z), 0);
+  const anomaly = hot.length >= 2 || maxZ >= adaptiveSettings.sensitivity + 1.4;
+
+  if (!anomaly) return null;
+
+  return {
+    detected: true,
+    severity: maxZ >= 4 ? 'critical' : 'high',
+    maxZ: Number(maxZ.toFixed(2)),
+    triggers: hot.map((s) => ({ metric: s.key, z: s.z, threshold: s.threshold })),
+    signals
+  };
+}
+
 function getReplayRateLimit() {
   const perMinute = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_per_min'])?.value || REPLAY_RATE_LIMIT_DEFAULT_PER_MIN);
   return {
@@ -1582,30 +1736,53 @@ function escalateSeverity(kind, baseSeverity) {
   return severityFromRank(escalatedRank);
 }
 
-function executeOpsAutoAction(kind, severity, snapshot) {
-  if (severity !== 'critical') return null;
+function executeOpsAutoAction(kind, severity, snapshot, context = null) {
+  const playbook = getOpsPlaybookSettings();
+  if (!playbook.enabled) return null;
+  if (playbook.criticalOnly && severity !== 'critical') return null;
 
   if (kind === 'ops_pending_jobs' || kind === 'ops_failed_jobs') {
     const current = getReplayPolicy();
-    const nextBatch = Math.max(5, Math.floor(current.batchSize * 0.7));
+    const nextBatch = Math.max(3, Math.floor(current.batchSize * (1 - playbook.queueBatchReductionPct)));
+    if (nextBatch === current.batchSize) return null;
     setGlobalSetting('replay_batch_size', nextBatch);
     return {
       action: 'replay_batch_size_reduced',
       from: current.batchSize,
-      to: nextBatch
+      to: nextBatch,
+      reductionPct: playbook.queueBatchReductionPct
     };
   }
 
   if (kind === 'ops_p95_latency' || kind === 'ops_error_rate') {
     const current = getReplayPolicy();
-    const nextBase = Math.min(120000, Math.max(current.baseDelayMs, 10000));
+    const nextBase = Math.min(120000, Math.max(current.baseDelayMs, playbook.latencyBackoffFloorMs));
     const nextMax = Math.min(3600000, Math.max(current.maxDelayMs, nextBase * 2));
+    if (nextBase === current.baseDelayMs && nextMax === current.maxDelayMs) return null;
     setGlobalSetting('replay_backoff_base_ms', nextBase);
     setGlobalSetting('replay_backoff_max_ms', nextMax);
     return {
       action: 'replay_backoff_hardened',
       baseDelayMs: nextBase,
       maxDelayMs: nextMax
+    };
+  }
+
+  if (kind === 'ops_anomaly_cluster' && playbook.allowOnAnomaly) {
+    const pauseUntil = Date.now() + playbook.anomalyReplayPauseMs;
+    const candidates = all(
+      'SELECT id FROM webhook_jobs WHERE status = ? AND next_run < ? ORDER BY next_run ASC LIMIT 100',
+      ['pending', pauseUntil]
+    );
+    for (const row of candidates) {
+      run('UPDATE webhook_jobs SET next_run = ?, updated_at = ? WHERE id = ?', [pauseUntil, Date.now(), row.id]);
+    }
+
+    return {
+      action: 'replay_window_paused',
+      delayedJobs: candidates.length,
+      pauseMs: playbook.anomalyReplayPauseMs,
+      reason: context?.maxZ ? `anomaly_z_${context.maxZ}` : 'anomaly'
     };
   }
 
@@ -1745,14 +1922,12 @@ function persistOpsSnapshot(snapshot) {
 }
 
 function createOpsAlert({ kind, severity, title, message, snapshot }) {
-  const existing = get(
-    'SELECT id FROM ops_alerts WHERE kind = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1',
-    [kind, Date.now() - OPS_ALERT_COOLDOWN_MS]
-  );
+  const cooldown = kind === 'ops_anomaly_cluster' ? OPS_ANOMALY_ALERT_COOLDOWN_MS : OPS_ALERT_COOLDOWN_MS;
+  const existing = get('SELECT id FROM ops_alerts WHERE kind = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1', [kind, Date.now() - cooldown]);
   if (existing) return null;
 
   const escalatedSeverity = escalateSeverity(kind, severity);
-  const autoAction = executeOpsAutoAction(kind, escalatedSeverity, snapshot);
+  const autoAction = executeOpsAutoAction(kind, escalatedSeverity, snapshot, snapshot?.anomaly || null);
   const actionText = autoAction ? ` Auto-Action: ${JSON.stringify(autoAction)}.` : '';
 
   const id = `ops_alert_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -1774,17 +1949,18 @@ function createOpsAlert({ kind, severity, title, message, snapshot }) {
   return row;
 }
 
-function evaluateOpsAlerts(snapshot) {
-  const thresholds = getOpsAlertThresholds();
+function evaluateOpsAlerts(snapshot, thresholdPack = null, anomaly = null) {
+  const thresholds = thresholdPack?.effective || getOpsAlertThresholds();
   const alerts = [];
+  const thresholdMode = thresholdPack?.mode || 'fixed';
 
   if (snapshot.failedJobs > thresholds.failedJobs) {
     const alert = createOpsAlert({
       kind: 'ops_failed_jobs',
       severity: snapshot.failedJobs > thresholds.failedJobs * 2 ? 'critical' : 'high',
       title: 'Webhook Dead-Letter ansteigend',
-      message: `Failed Jobs ${snapshot.failedJobs} ueber Schwelle ${thresholds.failedJobs}.`,
-      snapshot
+      message: `Failed Jobs ${snapshot.failedJobs} ueber Schwelle ${thresholds.failedJobs} (${thresholdMode}).`,
+      snapshot: { ...snapshot, thresholds, thresholdMode }
     });
     if (alert) alerts.push(alert);
   }
@@ -1794,8 +1970,8 @@ function evaluateOpsAlerts(snapshot) {
       kind: 'ops_pending_jobs',
       severity: snapshot.pendingJobs > thresholds.pendingJobs * 2 ? 'critical' : 'high',
       title: 'Webhook Queue-Backlog',
-      message: `Pending Jobs ${snapshot.pendingJobs} ueber Schwelle ${thresholds.pendingJobs}.`,
-      snapshot
+      message: `Pending Jobs ${snapshot.pendingJobs} ueber Schwelle ${thresholds.pendingJobs} (${thresholdMode}).`,
+      snapshot: { ...snapshot, thresholds, thresholdMode }
     });
     if (alert) alerts.push(alert);
   }
@@ -1805,8 +1981,8 @@ function evaluateOpsAlerts(snapshot) {
       kind: 'ops_p95_latency',
       severity: snapshot.p95LatencyMs > thresholds.p95LatencyMs * 1.5 ? 'critical' : 'high',
       title: 'API-Latenz Spike (p95)',
-      message: `p95 ${snapshot.p95LatencyMs.toFixed(1)}ms ueber Schwelle ${thresholds.p95LatencyMs}ms.`,
-      snapshot
+      message: `p95 ${snapshot.p95LatencyMs.toFixed(1)}ms ueber Schwelle ${thresholds.p95LatencyMs}ms (${thresholdMode}).`,
+      snapshot: { ...snapshot, thresholds, thresholdMode }
     });
     if (alert) alerts.push(alert);
   }
@@ -1816,8 +1992,19 @@ function evaluateOpsAlerts(snapshot) {
       kind: 'ops_error_rate',
       severity: snapshot.errorRate > thresholds.errorRate * 2 ? 'critical' : 'high',
       title: 'API-Error-Rate Spike',
-      message: `Error-Rate ${(snapshot.errorRate * 100).toFixed(2)}% ueber Schwelle ${(thresholds.errorRate * 100).toFixed(2)}%.`,
-      snapshot
+      message: `Error-Rate ${(snapshot.errorRate * 100).toFixed(2)}% ueber Schwelle ${(thresholds.errorRate * 100).toFixed(2)}% (${thresholdMode}).`,
+      snapshot: { ...snapshot, thresholds, thresholdMode }
+    });
+    if (alert) alerts.push(alert);
+  }
+
+  if (anomaly?.detected) {
+    const alert = createOpsAlert({
+      kind: 'ops_anomaly_cluster',
+      severity: anomaly.severity,
+      title: 'Anomaly-Cluster erkannt',
+      message: `Mehrere Metriken weichen signifikant ab (max z=${anomaly.maxZ}).`,
+      snapshot: { ...snapshot, anomaly, thresholds, thresholdMode }
     });
     if (alert) alerts.push(alert);
   }
@@ -1827,12 +2014,21 @@ function evaluateOpsAlerts(snapshot) {
 
 function runOpsMonitoringCycle() {
   const snapshot = getOpsSnapshot();
+  const adaptive = getOpsAdaptiveSettings();
+  const baseline = buildOpsBaseline(adaptive.lookbackSnapshots);
+  const thresholdPack = getEffectiveOpsThresholds(snapshot, baseline);
+  const anomaly = detectOpsAnomaly(snapshot, baseline, adaptive);
   persistOpsSnapshot(snapshot);
-  const alerts = evaluateOpsAlerts(snapshot);
+  const alerts = evaluateOpsAlerts(snapshot, thresholdPack, anomaly);
   if (alerts.length > 0) {
     broadcast('ops:monitor', { snapshot, alertsCreated: alerts.length });
   }
-  return { snapshot, alertsCreated: alerts.length };
+  return {
+    snapshot,
+    alertsCreated: alerts.length,
+    thresholds: thresholdPack,
+    anomaly: anomaly || { detected: false }
+  };
 }
 
 function computeBackoffDelay(attempts) {
@@ -2670,10 +2866,13 @@ app.post('/api/webhooks/replay_failed', async (req) => {
 });
 
 app.get('/api/ops/backpressure', async () => {
-  const pendingJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['pending'])?.c || 0);
-  const failedJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['failed'])?.c || 0);
+  const snapshot = getOpsSnapshot();
+  const adaptive = getOpsAdaptiveSettings();
+  const baseline = buildOpsBaseline(adaptive.lookbackSnapshots);
+  const thresholdPack = getEffectiveOpsThresholds(snapshot, baseline);
+  const anomaly = detectOpsAnomaly(snapshot, baseline, adaptive);
   return {
-    snapshot: getOpsSnapshot(),
+    snapshot,
     worker: {
       busy: workerCycleBusy,
       runs: workerCycleRuns,
@@ -2690,11 +2889,16 @@ app.get('/api/ops/backpressure', async () => {
       lastAt: webhookProcessorLastAt,
       intervalMs: WEBHOOK_PROCESS_INTERVAL_MS,
       batchSize: WEBHOOK_JOB_BATCH_SIZE,
-      pendingJobs,
-      failedJobs
+      pendingJobs: snapshot.pendingJobs,
+      failedJobs: snapshot.failedJobs
     },
     replayPolicy: getReplayPolicy(),
-    opsThresholds: getOpsAlertThresholds()
+    opsThresholds: thresholdPack.effective,
+    opsThresholdsStatic: thresholdPack.static,
+    opsThresholdMode: thresholdPack.mode,
+    opsAdaptive: adaptive,
+    opsPlaybooks: getOpsPlaybookSettings(),
+    anomaly: anomaly || { detected: false }
   };
 });
 
@@ -2720,6 +2924,57 @@ app.post('/api/ops/alerts/ack_all', async () => {
 });
 
 app.get('/api/ops/thresholds', async () => getOpsAlertThresholds());
+
+app.get('/api/ops/adaptive', async () => getOpsAdaptiveSettings());
+
+app.put('/api/ops/adaptive', async (req) => {
+  const current = getOpsAdaptiveSettings();
+  const { enabled, lookbackSnapshots, sensitivity, minBaselineSamples } = req.body ?? {};
+
+  const next = {
+    enabled: typeof enabled === 'boolean' ? enabled : current.enabled,
+    lookbackSnapshots: Number.isFinite(Number(lookbackSnapshots)) ? Math.max(20, Math.min(500, Math.round(Number(lookbackSnapshots)))) : current.lookbackSnapshots,
+    sensitivity: Number.isFinite(Number(sensitivity)) ? Math.max(1.2, Math.min(4, Number(sensitivity))) : current.sensitivity,
+    minBaselineSamples: Number.isFinite(Number(minBaselineSamples)) ? Math.max(10, Math.min(80, Math.round(Number(minBaselineSamples)))) : current.minBaselineSamples
+  };
+
+  setGlobalSetting('ops_adaptive_enabled', next.enabled ? 1 : 0);
+  setGlobalSetting('ops_adaptive_lookback', next.lookbackSnapshots);
+  setGlobalSetting('ops_adaptive_sensitivity', next.sensitivity);
+  setGlobalSetting('ops_adaptive_min_samples', next.minBaselineSamples);
+  return next;
+});
+
+app.get('/api/ops/playbooks', async () => getOpsPlaybookSettings());
+
+app.put('/api/ops/playbooks', async (req) => {
+  const current = getOpsPlaybookSettings();
+  const {
+    enabled,
+    criticalOnly,
+    allowOnAnomaly,
+    queueBatchReductionPct,
+    latencyBackoffFloorMs,
+    anomalyReplayPauseMs
+  } = req.body ?? {};
+
+  const next = {
+    enabled: typeof enabled === 'boolean' ? enabled : current.enabled,
+    criticalOnly: typeof criticalOnly === 'boolean' ? criticalOnly : current.criticalOnly,
+    allowOnAnomaly: typeof allowOnAnomaly === 'boolean' ? allowOnAnomaly : current.allowOnAnomaly,
+    queueBatchReductionPct: Number.isFinite(Number(queueBatchReductionPct)) ? Math.max(0.1, Math.min(0.8, Number(queueBatchReductionPct))) : current.queueBatchReductionPct,
+    latencyBackoffFloorMs: Number.isFinite(Number(latencyBackoffFloorMs)) ? Math.max(2000, Math.min(120000, Math.round(Number(latencyBackoffFloorMs)))) : current.latencyBackoffFloorMs,
+    anomalyReplayPauseMs: Number.isFinite(Number(anomalyReplayPauseMs)) ? Math.max(5000, Math.min(600000, Math.round(Number(anomalyReplayPauseMs)))) : current.anomalyReplayPauseMs
+  };
+
+  setGlobalSetting('ops_playbooks_enabled', next.enabled ? 1 : 0);
+  setGlobalSetting('ops_playbooks_critical_only', next.criticalOnly ? 1 : 0);
+  setGlobalSetting('ops_playbooks_allow_anomaly', next.allowOnAnomaly ? 1 : 0);
+  setGlobalSetting('ops_playbook_queue_batch_reduction_pct', next.queueBatchReductionPct);
+  setGlobalSetting('ops_playbook_latency_backoff_floor_ms', next.latencyBackoffFloorMs);
+  setGlobalSetting('ops_playbook_anomaly_replay_pause_ms', next.anomalyReplayPauseMs);
+  return next;
+});
 
 app.put('/api/ops/thresholds', async (req, reply) => {
   const current = getOpsAlertThresholds();

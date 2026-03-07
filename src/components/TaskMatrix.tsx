@@ -42,7 +42,9 @@ export default function TaskMatrix() {
         if (!row?.id) return;
         setTasks((prev) => {
           if (prev.some((t) => t.id === row.id)) return prev;
-          return [row, ...prev].slice(0, 60);
+          return [row, ...prev]
+            .sort((a, b) => Number(a.done) - Number(b.done) || Number(a.priority) - Number(b.priority) || Number(b.created_at) - Number(a.created_at))
+            .slice(0, 60);
         });
         return;
       }
@@ -72,6 +74,14 @@ export default function TaskMatrix() {
   }, []);
 
   const doneCount = useMemo(() => tasks.filter((t) => t.done).length, [tasks]);
+  const visibleTasks = useMemo(
+    () =>
+      tasks
+        .slice()
+        .sort((a, b) => Number(a.done) - Number(b.done) || Number(a.priority) - Number(b.priority) || Number(b.created_at) - Number(a.created_at))
+        .slice(0, 30),
+    [tasks]
+  );
 
   const addTask = async () => {
     if (!title.trim()) return;
@@ -84,7 +94,10 @@ export default function TaskMatrix() {
         { title, priority: 2 },
         { timeoutMs: 12000, retries: 1 }
       );
-      setTasks((prev) => [row, ...prev]);
+      setTasks((prev) => {
+        const next = prev.some((t) => t.id === row.id) ? prev : [row, ...prev];
+        return next.slice(0, 60);
+      });
       setTitle('');
       setError(null);
     } catch {
@@ -134,6 +147,12 @@ export default function TaskMatrix() {
           <input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                void addTask();
+              }
+            }}
             placeholder="Neue Task"
             className="flex-1 rounded-xl border border-slate-800/80 bg-black/40 px-3 py-2 text-sm"
           />
@@ -143,7 +162,7 @@ export default function TaskMatrix() {
         {error && <div className="mt-2 text-xs text-rose-300">{error}</div>}
 
         <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
-          {tasks.slice(0, 30).map((t) => (
+          {visibleTasks.map((t) => (
             <div
               key={t.id}
               className={
