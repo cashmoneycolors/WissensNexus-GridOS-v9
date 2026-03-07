@@ -315,6 +315,39 @@ export function migrate() {
 
     CREATE INDEX IF NOT EXISTS idx_ops_alerts_created_at
       ON ops_alerts(created_at);
+
+    CREATE TABLE IF NOT EXISTS replay_rate_counters (
+      minute_bucket INTEGER NOT NULL,
+      provider TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      hits INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (minute_bucket, provider, event_type)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_replay_rate_counters_updated_at
+      ON replay_rate_counters(updated_at);
+
+    CREATE TABLE IF NOT EXISTS ops_playbook_actions (
+      id TEXT PRIMARY KEY,
+      alert_kind TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      action_name TEXT NOT NULL,
+      status TEXT NOT NULL,
+      before_json TEXT NOT NULL,
+      after_json TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      rollback_json TEXT NOT NULL,
+      rollback_reason TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      rolled_back_at INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ops_playbook_actions_created_at
+      ON ops_playbook_actions(created_at);
+
+    CREATE INDEX IF NOT EXISTS idx_ops_playbook_actions_status
+      ON ops_playbook_actions(status);
   `);
 
   const ensureColumn = (table, column, def) => {

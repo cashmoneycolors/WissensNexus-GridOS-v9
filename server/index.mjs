@@ -507,6 +507,7 @@ const REPLAY_RATE_LIMIT_DEFAULT_PER_MIN = Number(process.env.REPLAY_RATE_LIMIT_P
 const OPS_REPORTS_DIR = path.join(CONTENT_DIR, 'ops_reports');
 
 const replayRateBuckets = new Map();
+let replayRateLastCleanupAt = 0;
 
 function normalizeExecutiveRole(rawRole) {
   const role = String(rawRole || '').trim().toUpperCase();
@@ -1562,6 +1563,10 @@ function getOpsPlaybookSettings() {
   const queueBatchReductionPct = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_queue_batch_reduction_pct'])?.value || 0.35);
   const latencyBackoffFloorMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_latency_backoff_floor_ms'])?.value || 10000);
   const anomalyReplayPauseMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_anomaly_replay_pause_ms'])?.value || 30000);
+  const maxActionsPerHour = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_max_actions_per_hour'])?.value || 8);
+  const actionCooldownMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_action_cooldown_ms'])?.value || 300000);
+  const autoRollbackMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_auto_rollback_ms'])?.value || 900000);
+  const rollbackOnStabilized = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_rollback_on_stabilized'])?.value || 1) === 1;
 
   return {
     enabled,
@@ -1569,7 +1574,11 @@ function getOpsPlaybookSettings() {
     allowOnAnomaly,
     queueBatchReductionPct: Number.isFinite(queueBatchReductionPct) ? Math.max(0.1, Math.min(0.8, Number(queueBatchReductionPct))) : 0.35,
     latencyBackoffFloorMs: Number.isFinite(latencyBackoffFloorMs) ? Math.max(2000, Math.min(120000, Math.round(latencyBackoffFloorMs))) : 10000,
-    anomalyReplayPauseMs: Number.isFinite(anomalyReplayPauseMs) ? Math.max(5000, Math.min(600000, Math.round(anomalyReplayPauseMs))) : 30000
+    anomalyReplayPauseMs: Number.isFinite(anomalyReplayPauseMs) ? Math.max(5000, Math.min(600000, Math.round(anomalyReplayPauseMs))) : 30000,
+    maxActionsPerHour: Number.isFinite(maxActionsPerHour) ? Math.max(1, Math.min(60, Math.round(maxActionsPerHour))) : 8,
+    actionCooldownMs: Number.isFinite(actionCooldownMs) ? Math.max(30000, Math.min(3600000, Math.round(actionCooldownMs))) : 300000,
+    autoRollbackMs: Number.isFinite(autoRollbackMs) ? Math.max(60000, Math.min(7200000, Math.round(autoRollbackMs))) : 900000,
+    rollbackOnStabilized
   };
 }
 
@@ -1696,19 +1705,181 @@ function detectOpsAnomaly(snapshot, baseline, adaptiveSettings) {
 
 function getReplayRateLimit() {
   const perMinute = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_per_min'])?.value || REPLAY_RATE_LIMIT_DEFAULT_PER_MIN);
+  const persistentEnabled = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_persistent_enabled'])?.value || 1) === 1;
+  const counterRetentionMinutes = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_retention_min'])?.value || 180);
   return {
-    perMinute: Number.isFinite(perMinute) ? Math.max(1, Math.min(5000, perMinute)) : REPLAY_RATE_LIMIT_DEFAULT_PER_MIN
+    perMinute: Number.isFinite(perMinute) ? Math.max(1, Math.min(5000, perMinute)) : REPLAY_RATE_LIMIT_DEFAULT_PER_MIN,
+    persistentEnabled,
+    counterRetentionMinutes: Number.isFinite(counterRetentionMinutes) ? Math.max(10, Math.min(1440, Math.round(counterRetentionMinutes))) : 180
+  };
+}
+
+function cleanupReplayRateCountersIfNeeded(retentionMinutes = 180) {
+  const nowTs = Date.now();
+  if (nowTs - replayRateLastCleanupAt < 60 * 1000) return;
+  replayRateLastCleanupAt = nowTs;
+  const minBucket = Math.floor(nowTs / 60000) - Math.max(10, Number(retentionMinutes || 180));
+  run('DELETE FROM replay_rate_counters WHERE minute_bucket < ?', [minBucket]);
+}
+
+function getReplayBucketHits(provider, eventType, minuteBucket) {
+  const row = get(
+    'SELECT hits FROM replay_rate_counters WHERE minute_bucket = ? AND provider = ? AND event_type = ? LIMIT 1',
+    [minuteBucket, String(provider || 'any'), String(eventType || 'any')]
+  );
+  return Number(row?.hits || 0);
+}
+
+function getReplayRateLimitUsage(provider = 'any', eventType = 'any') {
+  const minute = Math.floor(Date.now() / 60000);
+  return {
+    minuteBucket: minute,
+    provider: String(provider || 'any'),
+    eventType: String(eventType || 'any'),
+    hits: getReplayBucketHits(provider, eventType, minute)
   };
 }
 
 function isReplayAllowed(provider, eventType) {
-  const limit = getReplayRateLimit().perMinute;
+  const settings = getReplayRateLimit();
+  const limit = settings.perMinute;
   const minute = Math.floor(Date.now() / 60000);
   const key = `${String(provider || 'any')}:${String(eventType || 'any')}:${minute}`;
+
+  if (settings.persistentEnabled) {
+    cleanupReplayRateCountersIfNeeded(settings.counterRetentionMinutes);
+    const currentHits = getReplayBucketHits(provider, eventType, minute);
+    if (currentHits >= limit) return false;
+
+    run(
+      `INSERT INTO replay_rate_counters (minute_bucket, provider, event_type, hits, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(minute_bucket, provider, event_type)
+       DO UPDATE SET hits = replay_rate_counters.hits + 1, updated_at = excluded.updated_at`,
+      [minute, String(provider || 'any'), String(eventType || 'any'), 1, Date.now()]
+    );
+    return true;
+  }
+
   const current = Number(replayRateBuckets.get(key) || 0);
   if (current >= limit) return false;
   replayRateBuckets.set(key, current + 1);
   return true;
+}
+
+function countRecentPlaybookActions(windowMs) {
+  const since = Date.now() - Math.max(60000, Number(windowMs || 60 * 60 * 1000));
+  return Number(
+    get('SELECT COUNT(*) as c FROM ops_playbook_actions WHERE created_at >= ? AND status = ?', [since, 'applied'])?.c || 0
+  );
+}
+
+function hasRecentSamePlaybookAction(alertKind, actionName, cooldownMs) {
+  const since = Date.now() - Math.max(30000, Number(cooldownMs || 300000));
+  const row = get(
+    'SELECT id FROM ops_playbook_actions WHERE alert_kind = ? AND action_name = ? AND created_at >= ? AND status = ? LIMIT 1',
+    [alertKind, actionName, since, 'applied']
+  );
+  return Boolean(row);
+}
+
+function recordPlaybookAction({ alertKind, severity, actionName, beforeState, afterState, reason, rollbackState = null }) {
+  const id = `playbook_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  run(
+    'INSERT INTO ops_playbook_actions (id, alert_kind, severity, action_name, status, before_json, after_json, reason, rollback_json, rollback_reason, created_at, rolled_back_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      id,
+      String(alertKind || 'unknown'),
+      String(severity || 'low'),
+      String(actionName || 'unknown'),
+      'applied',
+      JSON.stringify(beforeState || {}),
+      JSON.stringify(afterState || {}),
+      String(reason || ''),
+      JSON.stringify(rollbackState || {}),
+      '',
+      Date.now(),
+      null
+    ]
+  );
+  return id;
+}
+
+function runPlaybookRollbackGuards(snapshot, anomaly = null) {
+  const cfg = getOpsPlaybookSettings();
+  if (!cfg.enabled || !cfg.rollbackOnStabilized) {
+    return { rolledBack: 0, checked: 0, skipped: 'disabled' };
+  }
+
+  const staticThresholds = getOpsAlertThresholds();
+  const stable =
+    !anomaly?.detected &&
+    Number(snapshot.pendingJobs || 0) <= staticThresholds.pendingJobs &&
+    Number(snapshot.failedJobs || 0) <= staticThresholds.failedJobs &&
+    Number(snapshot.p95LatencyMs || 0) <= staticThresholds.p95LatencyMs &&
+    Number(snapshot.errorRate || 0) <= staticThresholds.errorRate;
+
+  if (!stable) {
+    return { rolledBack: 0, checked: 0, skipped: 'not_stable' };
+  }
+
+  const cutoff = Date.now() - cfg.autoRollbackMs;
+  const rows = all(
+    'SELECT * FROM ops_playbook_actions WHERE status = ? AND created_at <= ? ORDER BY created_at ASC LIMIT 20',
+    ['applied', cutoff]
+  );
+
+  let rolledBack = 0;
+  for (const row of rows) {
+    let rollbackState = {};
+    try {
+      rollbackState = JSON.parse(String(row.rollback_json || '{}'));
+    } catch {
+      rollbackState = {};
+    }
+
+    const actionName = String(row.action_name || '');
+    if (actionName === 'replay_batch_size_reduced' && Number.isFinite(Number(rollbackState?.replayBatchSize))) {
+      setGlobalSetting('replay_batch_size', Math.max(1, Math.min(200, Number(rollbackState.replayBatchSize))));
+      run('UPDATE ops_playbook_actions SET status = ?, rollback_reason = ?, rolled_back_at = ? WHERE id = ?', [
+        'rolled_back',
+        'stabilized_auto_rollback',
+        Date.now(),
+        row.id
+      ]);
+      rolledBack += 1;
+      continue;
+    }
+
+    if (actionName === 'replay_backoff_hardened') {
+      const base = Number(rollbackState?.baseDelayMs);
+      const max = Number(rollbackState?.maxDelayMs);
+      if (Number.isFinite(base) && Number.isFinite(max)) {
+        const normalizedBase = Math.max(1000, base);
+        const normalizedMax = Math.max(normalizedBase, max);
+        setGlobalSetting('replay_backoff_base_ms', normalizedBase);
+        setGlobalSetting('replay_backoff_max_ms', normalizedMax);
+        run('UPDATE ops_playbook_actions SET status = ?, rollback_reason = ?, rolled_back_at = ? WHERE id = ?', [
+          'rolled_back',
+          'stabilized_auto_rollback',
+          Date.now(),
+          row.id
+        ]);
+        rolledBack += 1;
+        continue;
+      }
+    }
+
+    run('UPDATE ops_playbook_actions SET status = ?, rollback_reason = ?, rolled_back_at = ? WHERE id = ?', [
+      'rolled_back',
+      'no_state_or_not_needed',
+      Date.now(),
+      row.id
+    ]);
+    rolledBack += 1;
+  }
+
+  return { rolledBack, checked: rows.length, skipped: '' };
 }
 
 function severityRank(level) {
@@ -1741,11 +1912,23 @@ function executeOpsAutoAction(kind, severity, snapshot, context = null) {
   if (!playbook.enabled) return null;
   if (playbook.criticalOnly && severity !== 'critical') return null;
 
+  if (countRecentPlaybookActions(60 * 60 * 1000) >= playbook.maxActionsPerHour) return null;
+
   if (kind === 'ops_pending_jobs' || kind === 'ops_failed_jobs') {
+    if (hasRecentSamePlaybookAction(kind, 'replay_batch_size_reduced', playbook.actionCooldownMs)) return null;
     const current = getReplayPolicy();
     const nextBatch = Math.max(3, Math.floor(current.batchSize * (1 - playbook.queueBatchReductionPct)));
     if (nextBatch === current.batchSize) return null;
     setGlobalSetting('replay_batch_size', nextBatch);
+    recordPlaybookAction({
+      alertKind: kind,
+      severity,
+      actionName: 'replay_batch_size_reduced',
+      beforeState: { replayBatchSize: current.batchSize },
+      afterState: { replayBatchSize: nextBatch },
+      reason: `queue_guard_${kind}`,
+      rollbackState: { replayBatchSize: current.batchSize }
+    });
     return {
       action: 'replay_batch_size_reduced',
       from: current.batchSize,
@@ -1755,12 +1938,22 @@ function executeOpsAutoAction(kind, severity, snapshot, context = null) {
   }
 
   if (kind === 'ops_p95_latency' || kind === 'ops_error_rate') {
+    if (hasRecentSamePlaybookAction(kind, 'replay_backoff_hardened', playbook.actionCooldownMs)) return null;
     const current = getReplayPolicy();
     const nextBase = Math.min(120000, Math.max(current.baseDelayMs, playbook.latencyBackoffFloorMs));
     const nextMax = Math.min(3600000, Math.max(current.maxDelayMs, nextBase * 2));
     if (nextBase === current.baseDelayMs && nextMax === current.maxDelayMs) return null;
     setGlobalSetting('replay_backoff_base_ms', nextBase);
     setGlobalSetting('replay_backoff_max_ms', nextMax);
+    recordPlaybookAction({
+      alertKind: kind,
+      severity,
+      actionName: 'replay_backoff_hardened',
+      beforeState: { baseDelayMs: current.baseDelayMs, maxDelayMs: current.maxDelayMs },
+      afterState: { baseDelayMs: nextBase, maxDelayMs: nextMax },
+      reason: `latency_guard_${kind}`,
+      rollbackState: { baseDelayMs: current.baseDelayMs, maxDelayMs: current.maxDelayMs }
+    });
     return {
       action: 'replay_backoff_hardened',
       baseDelayMs: nextBase,
@@ -1769,6 +1962,7 @@ function executeOpsAutoAction(kind, severity, snapshot, context = null) {
   }
 
   if (kind === 'ops_anomaly_cluster' && playbook.allowOnAnomaly) {
+    if (hasRecentSamePlaybookAction(kind, 'replay_window_paused', playbook.actionCooldownMs)) return null;
     const pauseUntil = Date.now() + playbook.anomalyReplayPauseMs;
     const candidates = all(
       'SELECT id FROM webhook_jobs WHERE status = ? AND next_run < ? ORDER BY next_run ASC LIMIT 100',
@@ -1777,6 +1971,16 @@ function executeOpsAutoAction(kind, severity, snapshot, context = null) {
     for (const row of candidates) {
       run('UPDATE webhook_jobs SET next_run = ?, updated_at = ? WHERE id = ?', [pauseUntil, Date.now(), row.id]);
     }
+
+    recordPlaybookAction({
+      alertKind: kind,
+      severity,
+      actionName: 'replay_window_paused',
+      beforeState: { delayedJobs: 0 },
+      afterState: { delayedJobs: candidates.length, pauseUntil },
+      reason: context?.maxZ ? `anomaly_z_${context.maxZ}` : 'anomaly',
+      rollbackState: {}
+    });
 
     return {
       action: 'replay_window_paused',
@@ -2020,6 +2224,7 @@ function runOpsMonitoringCycle() {
   const anomaly = detectOpsAnomaly(snapshot, baseline, adaptive);
   persistOpsSnapshot(snapshot);
   const alerts = evaluateOpsAlerts(snapshot, thresholdPack, anomaly);
+  const rollback = runPlaybookRollbackGuards(snapshot, anomaly);
   if (alerts.length > 0) {
     broadcast('ops:monitor', { snapshot, alertsCreated: alerts.length });
   }
@@ -2027,7 +2232,8 @@ function runOpsMonitoringCycle() {
     snapshot,
     alertsCreated: alerts.length,
     thresholds: thresholdPack,
-    anomaly: anomaly || { detected: false }
+    anomaly: anomaly || { detected: false },
+    rollback
   };
 }
 
@@ -2772,15 +2978,39 @@ app.get('/api/webhooks/replay_policy', async () => {
 });
 
 app.get('/api/webhooks/replay_rate_limit', async () => {
-  return getReplayRateLimit();
+  const settings = getReplayRateLimit();
+  const provider = 'any';
+  const eventType = 'any';
+  const usage = getReplayRateLimitUsage(provider, eventType);
+  return {
+    ...settings,
+    usage,
+    remaining: Math.max(0, settings.perMinute - usage.hits)
+  };
 });
 
 app.put('/api/webhooks/replay_rate_limit', async (req, reply) => {
   const perMinute = Number(req.body?.perMinute);
+  const persistentEnabledRaw = req.body?.persistentEnabled;
+  const counterRetentionMinutesRaw = Number(req.body?.counterRetentionMinutes);
   if (!Number.isFinite(perMinute)) return reply.code(400).send({ error: 'perMinute required' });
   const normalized = Math.max(1, Math.min(5000, perMinute));
+  const current = getReplayRateLimit();
+  const persistentEnabled = typeof persistentEnabledRaw === 'boolean' ? persistentEnabledRaw : current.persistentEnabled;
+  const counterRetentionMinutes = Number.isFinite(counterRetentionMinutesRaw)
+    ? Math.max(10, Math.min(1440, Math.round(counterRetentionMinutesRaw)))
+    : current.counterRetentionMinutes;
   setGlobalSetting('replay_rate_limit_per_min', normalized);
-  return getReplayRateLimit();
+  setGlobalSetting('replay_rate_limit_persistent_enabled', persistentEnabled ? 1 : 0);
+  setGlobalSetting('replay_rate_limit_retention_min', counterRetentionMinutes);
+  cleanupReplayRateCountersIfNeeded(counterRetentionMinutes);
+  const settings = getReplayRateLimit();
+  const usage = getReplayRateLimitUsage('any', 'any');
+  return {
+    ...settings,
+    usage,
+    remaining: Math.max(0, settings.perMinute - usage.hits)
+  };
 });
 
 app.put('/api/webhooks/replay_policy', async (req, reply) => {
@@ -2947,6 +3177,20 @@ app.put('/api/ops/adaptive', async (req) => {
 
 app.get('/api/ops/playbooks', async () => getOpsPlaybookSettings());
 
+app.get('/api/ops/playbooks/actions', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 25);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, Math.round(limitRaw))) : 25;
+  return all('SELECT * FROM ops_playbook_actions ORDER BY created_at DESC LIMIT ?', [limit]);
+});
+
+app.post('/api/ops/playbooks/rollback_run', async () => {
+  const snapshot = getOpsSnapshot();
+  const adaptive = getOpsAdaptiveSettings();
+  const baseline = buildOpsBaseline(adaptive.lookbackSnapshots);
+  const anomaly = detectOpsAnomaly(snapshot, baseline, adaptive);
+  return runPlaybookRollbackGuards(snapshot, anomaly);
+});
+
 app.put('/api/ops/playbooks', async (req) => {
   const current = getOpsPlaybookSettings();
   const {
@@ -2955,7 +3199,11 @@ app.put('/api/ops/playbooks', async (req) => {
     allowOnAnomaly,
     queueBatchReductionPct,
     latencyBackoffFloorMs,
-    anomalyReplayPauseMs
+    anomalyReplayPauseMs,
+    maxActionsPerHour,
+    actionCooldownMs,
+    autoRollbackMs,
+    rollbackOnStabilized
   } = req.body ?? {};
 
   const next = {
@@ -2964,7 +3212,11 @@ app.put('/api/ops/playbooks', async (req) => {
     allowOnAnomaly: typeof allowOnAnomaly === 'boolean' ? allowOnAnomaly : current.allowOnAnomaly,
     queueBatchReductionPct: Number.isFinite(Number(queueBatchReductionPct)) ? Math.max(0.1, Math.min(0.8, Number(queueBatchReductionPct))) : current.queueBatchReductionPct,
     latencyBackoffFloorMs: Number.isFinite(Number(latencyBackoffFloorMs)) ? Math.max(2000, Math.min(120000, Math.round(Number(latencyBackoffFloorMs)))) : current.latencyBackoffFloorMs,
-    anomalyReplayPauseMs: Number.isFinite(Number(anomalyReplayPauseMs)) ? Math.max(5000, Math.min(600000, Math.round(Number(anomalyReplayPauseMs)))) : current.anomalyReplayPauseMs
+    anomalyReplayPauseMs: Number.isFinite(Number(anomalyReplayPauseMs)) ? Math.max(5000, Math.min(600000, Math.round(Number(anomalyReplayPauseMs)))) : current.anomalyReplayPauseMs,
+    maxActionsPerHour: Number.isFinite(Number(maxActionsPerHour)) ? Math.max(1, Math.min(60, Math.round(Number(maxActionsPerHour)))) : current.maxActionsPerHour,
+    actionCooldownMs: Number.isFinite(Number(actionCooldownMs)) ? Math.max(30000, Math.min(3600000, Math.round(Number(actionCooldownMs)))) : current.actionCooldownMs,
+    autoRollbackMs: Number.isFinite(Number(autoRollbackMs)) ? Math.max(60000, Math.min(7200000, Math.round(Number(autoRollbackMs)))) : current.autoRollbackMs,
+    rollbackOnStabilized: typeof rollbackOnStabilized === 'boolean' ? rollbackOnStabilized : current.rollbackOnStabilized
   };
 
   setGlobalSetting('ops_playbooks_enabled', next.enabled ? 1 : 0);
@@ -2973,6 +3225,10 @@ app.put('/api/ops/playbooks', async (req) => {
   setGlobalSetting('ops_playbook_queue_batch_reduction_pct', next.queueBatchReductionPct);
   setGlobalSetting('ops_playbook_latency_backoff_floor_ms', next.latencyBackoffFloorMs);
   setGlobalSetting('ops_playbook_anomaly_replay_pause_ms', next.anomalyReplayPauseMs);
+  setGlobalSetting('ops_playbook_max_actions_per_hour', next.maxActionsPerHour);
+  setGlobalSetting('ops_playbook_action_cooldown_ms', next.actionCooldownMs);
+  setGlobalSetting('ops_playbook_auto_rollback_ms', next.autoRollbackMs);
+  setGlobalSetting('ops_playbook_rollback_on_stabilized', next.rollbackOnStabilized ? 1 : 0);
   return next;
 });
 

@@ -484,6 +484,44 @@ Nutzen:
 - Incident-Reaktion wird automatisiert, aber kontrollierbar
 - Team kann Sensitivitaet und Remediation ohne Code-Redeploy steuern
 
+## 21) Stufe 12: Persistenter Replay-Limiter + Playbook-Orchestrierung mit Rollback-Guards
+
+Datei: `server/db.mjs`, `server/index.mjs`, `src/components/Dashboard.tsx`
+
+Umgesetzt:
+
+- Persistenter Replay-Rate-Limiter
+  - Neue Tabelle `replay_rate_counters` fuer minute-bucket Counter pro `provider/event_type`
+  - Limiter kann persistent betrieben werden (statt nur in-memory)
+  - Konfigurierbare Retention fuer Counter-Cleanup
+  - API erweitert:
+    - `GET /api/webhooks/replay_rate_limit` liefert Settings + aktuelle Nutzung/Remaining
+    - `PUT /api/webhooks/replay_rate_limit` setzt `perMinute`, `persistentEnabled`, `counterRetentionMinutes`
+- Playbook-Orchestrierung mit Safety-Guards
+  - Neue Tabelle `ops_playbook_actions` fuer Aktion-Audit inkl. Rollback-Status
+  - Guards gegen Over-Remediation:
+    - `maxActionsPerHour`
+    - `actionCooldownMs` pro Alert-Kind/Aktion
+  - Erweiterte Playbook-Settings:
+    - `autoRollbackMs`
+    - `rollbackOnStabilized`
+- Auto-Rollback bei stabilisiertem Betrieb
+  - Rollback-Guard prueft periodisch, ob Metriken wieder im stabilen Bereich liegen
+  - Geeignete fruehere Playbook-Aktionen werden automatisch zurueckgesetzt
+  - Neue APIs:
+    - `GET /api/ops/playbooks/actions`
+    - `POST /api/ops/playbooks/rollback_run`
+- Dashboard erweitert
+  - Replay-Limiter: persistent toggle, retention, usage/remaining live sichtbar
+  - Playbooks: neue Guard/Rollback Parameter editierbar
+  - Playbook-Aktionslog + manueller Rollback-Guard Run
+
+Nutzen:
+
+- Replay-Schutz bleibt robust auch ueber Prozess-Neustarts hinweg
+- Auto-Remediation wird auditierbar und begrenzt statt unkontrolliert
+- Stabilisierung fuehrt kontrolliert zur Rueckkehr auf Normalbetrieb
+
 ## Bekannte Folgeaenderung
 
 Datei: `server/data.sqlite`
@@ -499,7 +537,7 @@ Datei: `server/data.sqlite`
 
 ## Nächste Optimierungsstufe (optional)
 
-1. Replay-Rate-Limiter von In-Memory auf persistente/verteilte Counter erweitern.
-2. Playbook-Orchestrierung mit mehrstufigen Runbooks (inkl. Rollback/Timeout-Guards).
+1. Replay-Rate-Limiter von lokal-persistent auf verteilte Counter (Redis/Service) erweitern.
+2. Playbook-Orchestrierung mit mehrstufigen Runbooks (inkl. Approval-Gates) erweitern.
 3. PayPal-Sandbox/Live-Umschaltung fuer native Verify-API per Runtime-Setting.
 4. Geplante Report-Distribution (taeglicher Versand via SMTP/Webhook).

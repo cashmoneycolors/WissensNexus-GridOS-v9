@@ -100,6 +100,15 @@ type OpsThresholds = {
 
 type ReplayRateLimit = {
   perMinute: number;
+  persistentEnabled: boolean;
+  counterRetentionMinutes: number;
+  usage?: {
+    minuteBucket: number;
+    provider: string;
+    eventType: string;
+    hits: number;
+  };
+  remaining?: number;
 };
 
 type OpsAdaptiveSettings = {
@@ -116,6 +125,22 @@ type OpsPlaybookSettings = {
   queueBatchReductionPct: number;
   latencyBackoffFloorMs: number;
   anomalyReplayPauseMs: number;
+  maxActionsPerHour: number;
+  actionCooldownMs: number;
+  autoRollbackMs: number;
+  rollbackOnStabilized: boolean;
+};
+
+type OpsPlaybookActionRow = {
+  id: string;
+  alert_kind: string;
+  severity: string;
+  action_name: string;
+  status: string;
+  reason: string;
+  rollback_reason: string;
+  created_at: number;
+  rolled_back_at?: number | null;
 };
 
 type AnomalyState = {
@@ -158,8 +183,9 @@ export default function Dashboard({ metrics }: Props) {
   const [opsThresholds, setOpsThresholds] = useState<OpsThresholds>({ pendingJobs: 60, failedJobs: 5, p95LatencyMs: 700, errorRate: 0.05 });
   const [opsThresholdMode, setOpsThresholdMode] = useState<'fixed' | 'adaptive'>('fixed');
   const [opsAdaptive, setOpsAdaptive] = useState<OpsAdaptiveSettings>({ enabled: true, lookbackSnapshots: 60, sensitivity: 2.2, minBaselineSamples: 20 });
-  const [opsPlaybooks, setOpsPlaybooks] = useState<OpsPlaybookSettings>({ enabled: true, criticalOnly: true, allowOnAnomaly: true, queueBatchReductionPct: 0.35, latencyBackoffFloorMs: 10000, anomalyReplayPauseMs: 30000 });
-  const [replayRateLimit, setReplayRateLimit] = useState<ReplayRateLimit>({ perMinute: 30 });
+  const [opsPlaybooks, setOpsPlaybooks] = useState<OpsPlaybookSettings>({ enabled: true, criticalOnly: true, allowOnAnomaly: true, queueBatchReductionPct: 0.35, latencyBackoffFloorMs: 10000, anomalyReplayPauseMs: 30000, maxActionsPerHour: 8, actionCooldownMs: 300000, autoRollbackMs: 900000, rollbackOnStabilized: true });
+  const [replayRateLimit, setReplayRateLimit] = useState<ReplayRateLimit>({ perMinute: 30, persistentEnabled: true, counterRetentionMinutes: 180 });
+  const [playbookActions, setPlaybookActions] = useState<OpsPlaybookActionRow[]>([]);
   const [dailyReport, setDailyReport] = useState<DailyReport | null>(null);
   const [reportDate, setReportDate] = useState('');
   const [lastExportInfo, setLastExportInfo] = useState('');
@@ -202,7 +228,10 @@ export default function Dashboard({ metrics }: Props) {
         .catch(() => setOpsAlerts([]));
       apiGet<ReplayRateLimit>('/api/webhooks/replay_rate_limit')
         .then(setReplayRateLimit)
-        .catch(() => setReplayRateLimit({ perMinute: 30 }));
+        .catch(() => setReplayRateLimit({ perMinute: 30, persistentEnabled: true, counterRetentionMinutes: 180 }));
+      apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10')
+        .then((rows) => setPlaybookActions(Array.isArray(rows) ? rows : []))
+        .catch(() => setPlaybookActions([]));
       apiGet<DailyReport>(`/api/ops/report/daily${reportDate ? `?date=${encodeURIComponent(reportDate)}` : ''}`)
         .then(setDailyReport)
         .catch(() => setDailyReport(null));
@@ -336,6 +365,20 @@ export default function Dashboard({ metrics }: Props) {
     try {
       const next = await apiSend<OpsPlaybookSettings>('/api/ops/playbooks', 'PUT', opsPlaybooks);
       setOpsPlaybooks(next);
+      const rows = await apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10');
+      setPlaybookActions(Array.isArray(rows) ? rows : []);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const runPlaybookRollback = async () => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      await apiSend('/api/ops/playbooks/rollback_run', 'POST', {});
+      const rows = await apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10');
+      setPlaybookActions(Array.isArray(rows) ? rows : []);
     } finally {
       setOpsBusy(false);
     }
@@ -654,17 +697,37 @@ export default function Dashboard({ metrics }: Props) {
           </div>
           <div className="mt-3 rounded border border-slate-800/80 bg-slate-950/30 p-2">
             <div className="text-[11px] text-slate-400">Replay Rate Limit / min</div>
-            <div className="mt-1 flex items-center gap-2">
+            <div className="mt-1 flex items-center gap-2 flex-wrap">
               <input
                 type="number"
                 min={1}
                 max={5000}
                 value={replayRateLimit.perMinute}
-                onChange={(e) => setReplayRateLimit({ perMinute: Number(e.target.value || 1) })}
+                onChange={(e) => setReplayRateLimit((p) => ({ ...p, perMinute: Number(e.target.value || 1) }))}
                 aria-label="Replay rate limit per minute"
                 className="w-24 rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
               />
+              <input
+                type="number"
+                min={10}
+                max={1440}
+                value={replayRateLimit.counterRetentionMinutes}
+                onChange={(e) => setReplayRateLimit((p) => ({ ...p, counterRetentionMinutes: Number(e.target.value || 180) }))}
+                aria-label="Replay counter retention minutes"
+                className="w-24 rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+              />
+              <label className="flex items-center gap-1 text-[11px] text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={replayRateLimit.persistentEnabled}
+                  onChange={(e) => setReplayRateLimit((p) => ({ ...p, persistentEnabled: e.target.checked }))}
+                />
+                persistent
+              </label>
               <Button className="text-xs" onClick={saveReplayRateLimit} disabled={opsBusy}>Save</Button>
+            </div>
+            <div className="mt-1 text-[11px] text-slate-500">
+              usage {replayRateLimit.usage?.hits ?? 0}/{replayRateLimit.perMinute} · remaining {replayRateLimit.remaining ?? Math.max(0, replayRateLimit.perMinute - Number(replayRateLimit.usage?.hits || 0))}
             </div>
           </div>
         </Card>
@@ -816,8 +879,56 @@ export default function Dashboard({ metrics }: Props) {
                   aria-label="Anomaly replay pause ms"
                   className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
                 />
+                <input
+                  type="number"
+                  min={1}
+                  max={60}
+                  value={opsPlaybooks.maxActionsPerHour}
+                  onChange={(e) => setOpsPlaybooks((p) => ({ ...p, maxActionsPerHour: Number(e.target.value || 8) }))}
+                  aria-label="Max playbook actions per hour"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
+                <input
+                  type="number"
+                  min={30000}
+                  max={3600000}
+                  value={opsPlaybooks.actionCooldownMs}
+                  onChange={(e) => setOpsPlaybooks((p) => ({ ...p, actionCooldownMs: Number(e.target.value || 300000) }))}
+                  aria-label="Playbook action cooldown ms"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
+                <input
+                  type="number"
+                  min={60000}
+                  max={7200000}
+                  value={opsPlaybooks.autoRollbackMs}
+                  onChange={(e) => setOpsPlaybooks((p) => ({ ...p, autoRollbackMs: Number(e.target.value || 900000) }))}
+                  aria-label="Playbook auto rollback ms"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
               </div>
-              <Button className="mt-2 text-xs" onClick={saveOpsPlaybooks} disabled={opsBusy}>Save Playbooks</Button>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <label className="flex items-center gap-2 text-xs text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={opsPlaybooks.rollbackOnStabilized}
+                    onChange={(e) => setOpsPlaybooks((p) => ({ ...p, rollbackOnStabilized: e.target.checked }))}
+                  />
+                  rollback on stabilized
+                </label>
+              </div>
+              <div className="mt-2 flex gap-2">
+                <Button className="text-xs" onClick={saveOpsPlaybooks} disabled={opsBusy}>Save Playbooks</Button>
+                <Button className="text-xs" onClick={runPlaybookRollback} disabled={opsBusy}>Run Rollback Guard</Button>
+              </div>
+              <div className="mt-2 max-h-24 overflow-auto custom-scrollbar space-y-1">
+                {playbookActions.map((a) => (
+                  <div key={a.id} className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-[11px] text-slate-300">
+                    {new Date(a.created_at).toLocaleTimeString()} · {a.action_name} · {a.status}
+                  </div>
+                ))}
+                {playbookActions.length === 0 && <div className="text-[11px] text-slate-500">Noch keine Playbook-Aktionen.</div>}
+              </div>
             </div>
           </div>
         </Card>
