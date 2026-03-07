@@ -93,6 +93,25 @@ type OpsThresholds = {
   errorRate: number;
 };
 
+type ReplayRateLimit = {
+  perMinute: number;
+};
+
+type DailyReport = {
+  date: string;
+  summary: {
+    snapshots: number;
+    avgWorkerUtilization: number;
+    avgWebhookUtilization: number;
+    maxPendingJobs: number;
+    maxFailedJobs: number;
+    avgLatencyMs: number;
+    p95LatencyMs: number;
+    errorRate: number;
+    alertsCount: number;
+  };
+};
+
 function formatMoneyCHF(value: number) {
   return new Intl.NumberFormat('de-CH', {
     style: 'currency',
@@ -110,6 +129,10 @@ export default function Dashboard({ metrics }: Props) {
   const [opsHistory, setOpsHistory] = useState<OpsHistoryRow[]>([]);
   const [opsAlerts, setOpsAlerts] = useState<OpsAlertRow[]>([]);
   const [opsThresholds, setOpsThresholds] = useState<OpsThresholds>({ pendingJobs: 60, failedJobs: 5, p95LatencyMs: 700, errorRate: 0.05 });
+  const [replayRateLimit, setReplayRateLimit] = useState<ReplayRateLimit>({ perMinute: 30 });
+  const [dailyReport, setDailyReport] = useState<DailyReport | null>(null);
+  const [reportDate, setReportDate] = useState('');
+  const [lastExportInfo, setLastExportInfo] = useState('');
   const [providerFilter, setProviderFilter] = useState('');
   const [eventFilter, setEventFilter] = useState('');
   const [replayStrategy, setReplayStrategy] = useState<'reset' | 'preserve' | 'backoff'>('backoff');
@@ -144,6 +167,12 @@ export default function Dashboard({ metrics }: Props) {
       apiGet<OpsAlertRow[]>('/api/ops/alerts?onlyOpen=true&limit=8')
         .then((rows) => setOpsAlerts(Array.isArray(rows) ? rows : []))
         .catch(() => setOpsAlerts([]));
+      apiGet<ReplayRateLimit>('/api/webhooks/replay_rate_limit')
+        .then(setReplayRateLimit)
+        .catch(() => setReplayRateLimit({ perMinute: 30 }));
+      apiGet<DailyReport>(`/api/ops/report/daily${reportDate ? `?date=${encodeURIComponent(reportDate)}` : ''}`)
+        .then(setDailyReport)
+        .catch(() => setDailyReport(null));
     };
 
     load();
@@ -151,7 +180,7 @@ export default function Dashboard({ metrics }: Props) {
       if (document.visibilityState === 'visible') load();
     }, 5000);
     return () => clearInterval(i);
-  }, [providerFilter, eventFilter, replayBatchSize]);
+  }, [providerFilter, eventFilter, replayBatchSize, reportDate]);
 
   const saveBudget = async () => {
     const val = parseFloat(budgetVal);
@@ -237,6 +266,33 @@ export default function Dashboard({ metrics }: Props) {
     try {
       const next = await apiSend<OpsThresholds>('/api/ops/thresholds', 'PUT', opsThresholds);
       setOpsThresholds(next);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const saveReplayRateLimit = async () => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      const next = await apiSend<ReplayRateLimit>('/api/webhooks/replay_rate_limit', 'PUT', replayRateLimit);
+      setReplayRateLimit(next);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const exportDailyReport = async (format: 'json' | 'csv') => {
+    if (opsBusy) return;
+    setOpsBusy(true);
+    try {
+      const result = await apiSend<{ fileName: string; bytes: number }>('/api/ops/report/daily/export', 'POST', {
+        date: reportDate || undefined,
+        format
+      });
+      setLastExportInfo(`${result.fileName} (${result.bytes} bytes)`);
+      const report = await apiGet<DailyReport>(`/api/ops/report/daily${reportDate ? `?date=${encodeURIComponent(reportDate)}` : ''}`);
+      setDailyReport(report);
     } finally {
       setOpsBusy(false);
     }
@@ -526,6 +582,61 @@ export default function Dashboard({ metrics }: Props) {
               </div>
             ))}
             {opsAlerts.length === 0 && <div className="text-xs text-slate-500">Keine offenen Ops-Alerts.</div>}
+          </div>
+          <div className="mt-3 rounded border border-slate-800/80 bg-slate-950/30 p-2">
+            <div className="text-[11px] text-slate-400">Replay Rate Limit / min</div>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                type="number"
+                min={1}
+                max={5000}
+                value={replayRateLimit.perMinute}
+                onChange={(e) => setReplayRateLimit({ perMinute: Number(e.target.value || 1) })}
+                aria-label="Replay rate limit per minute"
+                className="w-24 rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+              />
+              <Button className="text-xs" onClick={saveReplayRateLimit} disabled={opsBusy}>Save</Button>
+            </div>
+          </div>
+        </Card>
+
+        <Card className="p-4 sm:col-span-2 lg:col-span-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-xs font-semibold text-slate-400">Daily Ops Report</div>
+            <div className="flex gap-2">
+              <Button className="text-xs" onClick={() => exportDailyReport('json')} disabled={opsBusy}>Export JSON</Button>
+              <Button className="text-xs" onClick={() => exportDailyReport('csv')} disabled={opsBusy}>Export CSV</Button>
+            </div>
+          </div>
+          <div className="mt-2 grid gap-2 sm:grid-cols-[180px,1fr]">
+            <input
+              type="date"
+              value={reportDate}
+              onChange={(e) => setReportDate(e.target.value)}
+              aria-label="Report date"
+              className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+            />
+            <div className="text-xs text-slate-500">
+              {lastExportInfo ? `Letzter Export: ${lastExportInfo}` : 'Kein Export in dieser Session.'}
+            </div>
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4 text-xs">
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">Snapshots</div>
+              <div className="font-bold text-slate-100">{dailyReport?.summary.snapshots ?? 0}</div>
+            </div>
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">p95</div>
+              <div className="font-bold text-slate-100">{Number(dailyReport?.summary.p95LatencyMs || 0).toFixed(1)} ms</div>
+            </div>
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">Err Rate</div>
+              <div className="font-bold text-slate-100">{(Number(dailyReport?.summary.errorRate || 0) * 100).toFixed(2)}%</div>
+            </div>
+            <div className="rounded border border-slate-800/80 bg-slate-950/30 p-2">
+              <div className="text-slate-500">Ops Alerts</div>
+              <div className="font-bold text-slate-100">{dailyReport?.summary.alertsCount ?? 0}</div>
+            </div>
           </div>
         </Card>
       </div>

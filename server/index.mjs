@@ -502,6 +502,10 @@ const ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const PAYPAL_WEBHOOK_ID = String(process.env.PAYPAL_WEBHOOK_ID || '');
 const PAYPAL_API_BASE = String(process.env.PAYPAL_API_BASE || 'https://api-m.paypal.com');
 const OPS_ALERT_COOLDOWN_MS = Number(process.env.OPS_ALERT_COOLDOWN_MS || 30 * 60 * 1000);
+const REPLAY_RATE_LIMIT_DEFAULT_PER_MIN = Number(process.env.REPLAY_RATE_LIMIT_PER_MIN || 30);
+const OPS_REPORTS_DIR = path.join(CONTENT_DIR, 'ops_reports');
+
+const replayRateBuckets = new Map();
 
 function normalizeExecutiveRole(rawRole) {
   const role = String(rawRole || '').trim().toUpperCase();
@@ -1536,6 +1540,154 @@ function getOpsAlertThresholds() {
   };
 }
 
+function getReplayRateLimit() {
+  const perMinute = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_per_min'])?.value || REPLAY_RATE_LIMIT_DEFAULT_PER_MIN);
+  return {
+    perMinute: Number.isFinite(perMinute) ? Math.max(1, Math.min(5000, perMinute)) : REPLAY_RATE_LIMIT_DEFAULT_PER_MIN
+  };
+}
+
+function isReplayAllowed(provider, eventType) {
+  const limit = getReplayRateLimit().perMinute;
+  const minute = Math.floor(Date.now() / 60000);
+  const key = `${String(provider || 'any')}:${String(eventType || 'any')}:${minute}`;
+  const current = Number(replayRateBuckets.get(key) || 0);
+  if (current >= limit) return false;
+  replayRateBuckets.set(key, current + 1);
+  return true;
+}
+
+function severityRank(level) {
+  const map = { low: 1, medium: 2, high: 3, critical: 4 };
+  return map[String(level || 'low').toLowerCase()] || 1;
+}
+
+function severityFromRank(rank) {
+  if (rank >= 4) return 'critical';
+  if (rank >= 3) return 'high';
+  if (rank >= 2) return 'medium';
+  return 'low';
+}
+
+function escalateSeverity(kind, baseSeverity) {
+  const recent = all(
+    'SELECT severity FROM ops_alerts WHERE kind = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 3',
+    [kind, Date.now() - 6 * 60 * 60 * 1000]
+  );
+
+  const repeats = recent.length;
+  const baseRank = severityRank(baseSeverity);
+  const maxRecentRank = recent.reduce((m, r) => Math.max(m, severityRank(r.severity)), 0);
+  const escalatedRank = Math.min(4, Math.max(baseRank, maxRecentRank) + (repeats >= 2 ? 1 : 0));
+  return severityFromRank(escalatedRank);
+}
+
+function executeOpsAutoAction(kind, severity, snapshot) {
+  if (severity !== 'critical') return null;
+
+  if (kind === 'ops_pending_jobs' || kind === 'ops_failed_jobs') {
+    const current = getReplayPolicy();
+    const nextBatch = Math.max(5, Math.floor(current.batchSize * 0.7));
+    setGlobalSetting('replay_batch_size', nextBatch);
+    return {
+      action: 'replay_batch_size_reduced',
+      from: current.batchSize,
+      to: nextBatch
+    };
+  }
+
+  if (kind === 'ops_p95_latency' || kind === 'ops_error_rate') {
+    const current = getReplayPolicy();
+    const nextBase = Math.min(120000, Math.max(current.baseDelayMs, 10000));
+    const nextMax = Math.min(3600000, Math.max(current.maxDelayMs, nextBase * 2));
+    setGlobalSetting('replay_backoff_base_ms', nextBase);
+    setGlobalSetting('replay_backoff_max_ms', nextMax);
+    return {
+      action: 'replay_backoff_hardened',
+      baseDelayMs: nextBase,
+      maxDelayMs: nextMax
+    };
+  }
+
+  return null;
+}
+
+function getDayRangeUtc(dateText = '') {
+  const now = new Date();
+  const base = /^\d{4}-\d{2}-\d{2}$/.test(String(dateText || ''))
+    ? new Date(`${dateText}T00:00:00.000Z`)
+    : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = base.getTime();
+  const end = start + 24 * 60 * 60 * 1000;
+  const date = base.toISOString().slice(0, 10);
+  return { start, end, date };
+}
+
+function buildDailyOpsReport(dateText = '') {
+  const { start, end, date } = getDayRangeUtc(dateText);
+  const history = all('SELECT * FROM ops_history WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC', [start, end]);
+  const traces = all('SELECT route, method, latency_ms, ok FROM request_traces WHERE created_at >= ? AND created_at < ?', [start, end]);
+  const alerts = all('SELECT kind, severity, title, created_at FROM ops_alerts WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC', [start, end]);
+
+  const historyCount = history.length;
+  const avg = (arr, pick) => (arr.length ? arr.reduce((s, x) => s + Number(pick(x) || 0), 0) / arr.length : 0);
+  const max = (arr, pick) => (arr.length ? arr.reduce((m, x) => Math.max(m, Number(pick(x) || 0)), 0) : 0);
+
+  const latencyValues = traces.map((t) => Number(t.latency_ms || 0)).sort((a, b) => a - b);
+  const p95LatencyMs = latencyValues.length ? latencyValues[Math.max(0, Math.floor(latencyValues.length * 0.95) - 1)] : 0;
+  const errorRate = traces.length ? traces.filter((t) => Number(t.ok || 0) === 0).length / traces.length : 0;
+
+  const byRoute = {};
+  for (const t of traces) {
+    const key = `${t.method} ${t.route}`;
+    if (!byRoute[key]) byRoute[key] = { route: t.route, method: t.method, hits: 0, latency: 0 };
+    byRoute[key].hits += 1;
+    byRoute[key].latency += Number(t.latency_ms || 0);
+  }
+  const topSlowRoutes = Object.values(byRoute)
+    .map((r) => ({ ...r, avgLatencyMs: r.hits ? Number((r.latency / r.hits).toFixed(2)) : 0 }))
+    .sort((a, b) => b.avgLatencyMs - a.avgLatencyMs)
+    .slice(0, 10);
+
+  return {
+    date,
+    windowUtc: { start, end },
+    summary: {
+      snapshots: historyCount,
+      avgWorkerUtilization: Number(avg(history, (x) => x.worker_utilization).toFixed(2)),
+      avgWebhookUtilization: Number(avg(history, (x) => x.webhook_utilization).toFixed(2)),
+      maxPendingJobs: Number(max(history, (x) => x.pending_jobs)),
+      maxFailedJobs: Number(max(history, (x) => x.failed_jobs)),
+      avgLatencyMs: Number(avg(traces, (x) => x.latency_ms).toFixed(2)),
+      p95LatencyMs: Number(Number(p95LatencyMs).toFixed(2)),
+      errorRate: Number(errorRate.toFixed(4)),
+      alertsCount: alerts.length
+    },
+    topSlowRoutes,
+    alerts,
+    history
+  };
+}
+
+function dailyReportToCsv(report) {
+  const lines = [];
+  lines.push('section,key,value');
+  for (const [k, v] of Object.entries(report.summary || {})) {
+    lines.push(`summary,${k},${String(v).replace(/,/g, ';')}`);
+  }
+  lines.push('');
+  lines.push('routes,method,route,hits,avgLatencyMs');
+  for (const r of report.topSlowRoutes || []) {
+    lines.push(`routes,${r.method},${String(r.route).replace(/,/g, ';')},${r.hits},${r.avgLatencyMs}`);
+  }
+  lines.push('');
+  lines.push('alerts,kind,severity,title,createdAt');
+  for (const a of report.alerts || []) {
+    lines.push(`alerts,${a.kind},${a.severity},${String(a.title).replace(/,/g, ';')},${a.created_at}`);
+  }
+  return lines.join('\n');
+}
+
 function getOpsSnapshot() {
   const pendingJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['pending'])?.c || 0);
   const failedJobs = Number(get('SELECT COUNT(*) as c FROM webhook_jobs WHERE status = ?', ['failed'])?.c || 0);
@@ -1599,16 +1751,20 @@ function createOpsAlert({ kind, severity, title, message, snapshot }) {
   );
   if (existing) return null;
 
+  const escalatedSeverity = escalateSeverity(kind, severity);
+  const autoAction = executeOpsAutoAction(kind, escalatedSeverity, snapshot);
+  const actionText = autoAction ? ` Auto-Action: ${JSON.stringify(autoAction)}.` : '';
+
   const id = `ops_alert_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   run(
     'INSERT INTO ops_alerts (id, kind, severity, title, message, snapshot_json, acknowledged, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [
       id,
       kind,
-      severity,
+      escalatedSeverity,
       title,
-      message,
-      JSON.stringify(snapshot),
+      `${message}${actionText}`,
+      JSON.stringify({ ...snapshot, autoAction }),
       0,
       Date.now()
     ]
@@ -2419,6 +2575,18 @@ app.get('/api/webhooks/replay_policy', async () => {
   return getReplayPolicy();
 });
 
+app.get('/api/webhooks/replay_rate_limit', async () => {
+  return getReplayRateLimit();
+});
+
+app.put('/api/webhooks/replay_rate_limit', async (req, reply) => {
+  const perMinute = Number(req.body?.perMinute);
+  if (!Number.isFinite(perMinute)) return reply.code(400).send({ error: 'perMinute required' });
+  const normalized = Math.max(1, Math.min(5000, perMinute));
+  setGlobalSetting('replay_rate_limit_per_min', normalized);
+  return getReplayRateLimit();
+});
+
 app.put('/api/webhooks/replay_policy', async (req, reply) => {
   const { baseDelayMs, maxDelayMs, batchSize } = req.body ?? {};
   if (!Number.isFinite(Number(baseDelayMs)) || !Number.isFinite(Number(maxDelayMs)) || !Number.isFinite(Number(batchSize))) {
@@ -2438,6 +2606,10 @@ app.post('/api/webhooks/replay/:id', async (req, reply) => {
   const { id } = req.params;
   const row = get('SELECT * FROM webhook_jobs WHERE id = ? LIMIT 1', [id]);
   if (!row) return reply.code(404).send({ error: 'job not found' });
+
+  if (!isReplayAllowed(row.provider, row.event_type)) {
+    return reply.code(429).send({ error: 'Replay rate limit exceeded for provider/event' });
+  }
 
   const strategy = String(req.body?.strategy || 'reset').toLowerCase();
   const attempts = strategy === 'preserve' ? Number(row.attempts || 0) : 0;
@@ -2462,11 +2634,17 @@ app.post('/api/webhooks/replay_failed', async (req) => {
   const batchSize = Number.isFinite(batchSizeRaw) ? Math.max(1, Math.min(500, batchSizeRaw)) : getReplayPolicy().batchSize;
 
   const rows = all(
-    'SELECT id, attempts FROM webhook_jobs WHERE status = ? AND (? = "" OR provider = ?) AND (? = "" OR event_type = ?) ORDER BY updated_at DESC LIMIT ?',
+    'SELECT id, attempts, provider, event_type FROM webhook_jobs WHERE status = ? AND (? = "" OR provider = ?) AND (? = "" OR event_type = ?) ORDER BY updated_at DESC LIMIT ?',
     ['failed', provider, provider, eventType, eventType, batchSize]
   );
 
+  let rateLimited = 0;
+  let replayed = 0;
   for (const row of rows) {
+    if (!isReplayAllowed(row.provider, row.event_type)) {
+      rateLimited += 1;
+      continue;
+    }
     const attempts = strategy === 'preserve' ? Number(row.attempts || 0) : 0;
     const nextRun = Date.now() + (strategy === 'backoff' ? computeBackoffDelay(attempts) : 0);
     run('UPDATE webhook_jobs SET status = ?, attempts = ?, next_run = ?, updated_at = ? WHERE id = ?', [
@@ -2476,9 +2654,19 @@ app.post('/api/webhooks/replay_failed', async (req) => {
       Date.now(),
       row.id
     ]);
+    replayed += 1;
   }
 
-  return { ok: true, count: rows.length, strategy, provider: provider || null, eventType: eventType || null, batchSize };
+  return {
+    ok: true,
+    count: replayed,
+    rateLimited,
+    strategy,
+    provider: provider || null,
+    eventType: eventType || null,
+    batchSize,
+    replayRateLimit: getReplayRateLimit().perMinute
+  };
 });
 
 app.get('/api/ops/backpressure', async () => {
@@ -2553,6 +2741,43 @@ app.put('/api/ops/thresholds', async (req, reply) => {
 
 app.post('/api/ops/monitor/run', async () => {
   return runOpsMonitoringCycle();
+});
+
+app.get('/api/ops/report/daily', async (req, reply) => {
+  const date = String(req.query?.date || '');
+  const format = String(req.query?.format || 'json').toLowerCase();
+  const report = buildDailyOpsReport(date);
+
+  if (format === 'csv') {
+    reply.header('Content-Type', 'text/csv; charset=utf-8');
+    return dailyReportToCsv(report);
+  }
+  return report;
+});
+
+app.post('/api/ops/report/daily/export', async (req, reply) => {
+  const { date = '', format = 'json' } = req.body ?? {};
+  const normalizedFormat = String(format).toLowerCase() === 'csv' ? 'csv' : 'json';
+  const report = buildDailyOpsReport(String(date || ''));
+  const targetDate = report.date;
+
+  if (!fs.existsSync(OPS_REPORTS_DIR)) {
+    fs.mkdirSync(OPS_REPORTS_DIR, { recursive: true });
+  }
+
+  const fileName = `ops_report_${targetDate}.${normalizedFormat}`;
+  const filePath = path.join(OPS_REPORTS_DIR, fileName);
+  const content = normalizedFormat === 'csv' ? dailyReportToCsv(report) : JSON.stringify(report, null, 2);
+  fs.writeFileSync(filePath, content, 'utf8');
+
+  return {
+    ok: true,
+    fileName,
+    filePath,
+    format: normalizedFormat,
+    date: targetDate,
+    bytes: Buffer.byteLength(content, 'utf8')
+  };
 });
 
 app.get('/api/download/:token', async (req, reply) => {

@@ -412,6 +412,34 @@ Nutzen:
 - Last-/Queue-Verhalten ist historisch nachvollziehbar
 - Schwellwerte sind ohne Codeaenderung direkt im UI anpassbar
 
+## 19) Stufe 10: Alert-Eskalation + Replay-Rate-Limiter + Daily Ops Report
+
+Datei: `server/index.mjs`, `src/components/Dashboard.tsx`
+
+Umgesetzt:
+
+- Ops-Alert Eskalation mit Auto-Action
+  - Severity-Eskalation bei wiederholten Incidents (`low -> medium -> high -> critical`)
+  - Kritische Alerts triggern Auto-Actions:
+    - Queue-Krise: `replay_batch_size` wird reduziert
+    - Latenz/Error-Krise: Replay-Backoff wird gehaertet
+- Replay-Rate-Limiter pro Provider/Event
+  - Schutz gegen massenhaftes Requeue innerhalb einer Minute
+  - Neue APIs:
+    - `GET /api/webhooks/replay_rate_limit`
+    - `PUT /api/webhooks/replay_rate_limit`
+  - Replay-Endpunkte liefern bei Limit-Verletzung kontrolliert `429`
+- Daily Ops Report (JSON/CSV)
+  - `GET /api/ops/report/daily?date=YYYY-MM-DD&format=json|csv`
+  - `POST /api/ops/report/daily/export` schreibt Datei in `output_content/ops_reports`
+  - Dashboard zeigt Daily-Summary und erlaubt Export
+
+Nutzen:
+
+- Wiederkehrende Betriebsprobleme werden automatisch schaerfer priorisiert
+- Replay bleibt auch bei Incident-Last kontrolliert und fair
+- Tagesberichte sind sofort fuer Review/Audit exportierbar
+
 ## Bekannte Folgeaenderung
 
 Datei: `server/data.sqlite`
@@ -427,7 +455,7 @@ Datei: `server/data.sqlite`
 
 ## Nächste Optimierungsstufe (optional)
 
-1. Ops-Alert Eskalation (Warnung -> Critical -> Auto-Action) mit abgestuften Policies.
-2. Replay-Rate-Limiting pro Provider/Event-Typ fuer noch feinere Lastkontrolle.
+1. Replay-Rate-Limiter von In-Memory auf persistente/verteilte Counter erweitern.
+2. Auto-Action-Playbooks pro Alert-Typ (mehr als Backoff/Batch-Adjustments).
 3. PayPal-Sandbox/Live-Umschaltung fuer native Verify-API per Runtime-Setting.
-4. Aggregierte Daily/Ops-Reports fuer Management-Review (CSV/JSON Export).
+4. Geplante Report-Distribution (taeglicher Versand via SMTP/Webhook).
