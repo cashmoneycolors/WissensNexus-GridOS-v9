@@ -504,6 +504,7 @@ const PAYPAL_API_BASE = String(process.env.PAYPAL_API_BASE || 'https://api-m.pay
 const OPS_ALERT_COOLDOWN_MS = Number(process.env.OPS_ALERT_COOLDOWN_MS || 30 * 60 * 1000);
 const OPS_ANOMALY_ALERT_COOLDOWN_MS = Number(process.env.OPS_ANOMALY_ALERT_COOLDOWN_MS || 20 * 60 * 1000);
 const REPLAY_RATE_LIMIT_DEFAULT_PER_MIN = Number(process.env.REPLAY_RATE_LIMIT_PER_MIN || 30);
+const REPLAY_COUNTER_HTTP_TIMEOUT_MS = Number(process.env.REPLAY_COUNTER_HTTP_TIMEOUT_MS || 1500);
 const OPS_REPORTS_DIR = path.join(CONTENT_DIR, 'ops_reports');
 
 const replayRateBuckets = new Map();
@@ -1567,6 +1568,9 @@ function getOpsPlaybookSettings() {
   const actionCooldownMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_action_cooldown_ms'])?.value || 300000);
   const autoRollbackMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_auto_rollback_ms'])?.value || 900000);
   const rollbackOnStabilized = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_rollback_on_stabilized'])?.value || 1) === 1;
+  const approvalModeRaw = String(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_approval_mode'])?.value || 'critical').toLowerCase();
+  const approvalWindowMs = Number(get('SELECT value FROM global_settings WHERE key = ?', ['ops_playbook_approval_window_ms'])?.value || 900000);
+  const approvalMode = ['auto', 'critical', 'manual'].includes(approvalModeRaw) ? approvalModeRaw : 'critical';
 
   return {
     enabled,
@@ -1578,7 +1582,9 @@ function getOpsPlaybookSettings() {
     maxActionsPerHour: Number.isFinite(maxActionsPerHour) ? Math.max(1, Math.min(60, Math.round(maxActionsPerHour))) : 8,
     actionCooldownMs: Number.isFinite(actionCooldownMs) ? Math.max(30000, Math.min(3600000, Math.round(actionCooldownMs))) : 300000,
     autoRollbackMs: Number.isFinite(autoRollbackMs) ? Math.max(60000, Math.min(7200000, Math.round(autoRollbackMs))) : 900000,
-    rollbackOnStabilized
+    rollbackOnStabilized,
+    approvalMode,
+    approvalWindowMs: Number.isFinite(approvalWindowMs) ? Math.max(60000, Math.min(7200000, Math.round(approvalWindowMs))) : 900000
   };
 }
 
@@ -1707,10 +1713,18 @@ function getReplayRateLimit() {
   const perMinute = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_per_min'])?.value || REPLAY_RATE_LIMIT_DEFAULT_PER_MIN);
   const persistentEnabled = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_persistent_enabled'])?.value || 1) === 1;
   const counterRetentionMinutes = Number(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_retention_min'])?.value || 180);
+  const backendRaw = String(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_backend'])?.value || 'sqlite').toLowerCase();
+  const backend = ['memory', 'sqlite', 'http'].includes(backendRaw) ? backendRaw : 'sqlite';
+  const httpEndpoint = String(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_http_endpoint'])?.value || '').trim();
+  const httpToken = String(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_http_token'])?.value || '').trim();
   return {
     perMinute: Number.isFinite(perMinute) ? Math.max(1, Math.min(5000, perMinute)) : REPLAY_RATE_LIMIT_DEFAULT_PER_MIN,
     persistentEnabled,
-    counterRetentionMinutes: Number.isFinite(counterRetentionMinutes) ? Math.max(10, Math.min(1440, Math.round(counterRetentionMinutes))) : 180
+    counterRetentionMinutes: Number.isFinite(counterRetentionMinutes) ? Math.max(10, Math.min(1440, Math.round(counterRetentionMinutes))) : 180,
+    backend,
+    httpEndpoint,
+    httpConfigured: Boolean(httpEndpoint),
+    httpTokenConfigured: Boolean(httpToken)
   };
 }
 
@@ -1730,7 +1744,7 @@ function getReplayBucketHits(provider, eventType, minuteBucket) {
   return Number(row?.hits || 0);
 }
 
-function getReplayRateLimitUsage(provider = 'any', eventType = 'any') {
+function getReplayRateLimitUsageSqlite(provider = 'any', eventType = 'any') {
   const minute = Math.floor(Date.now() / 60000);
   return {
     minuteBucket: minute,
@@ -1740,13 +1754,78 @@ function getReplayRateLimitUsage(provider = 'any', eventType = 'any') {
   };
 }
 
-function isReplayAllowed(provider, eventType) {
+function getReplayRateLimitUsageMemory(provider = 'any', eventType = 'any') {
+  const minute = Math.floor(Date.now() / 60000);
+  const key = `${String(provider || 'any')}:${String(eventType || 'any')}:${minute}`;
+  return {
+    minuteBucket: minute,
+    provider: String(provider || 'any'),
+    eventType: String(eventType || 'any'),
+    hits: Number(replayRateBuckets.get(key) || 0)
+  };
+}
+
+async function getReplayRateLimitUsage(provider = 'any', eventType = 'any') {
+  const settings = getReplayRateLimit();
+  if (settings.backend === 'memory') return getReplayRateLimitUsageMemory(provider, eventType);
+  if (settings.backend === 'sqlite') return getReplayRateLimitUsageSqlite(provider, eventType);
+  return {
+    minuteBucket: Math.floor(Date.now() / 60000),
+    provider: String(provider || 'any'),
+    eventType: String(eventType || 'any'),
+    hits: 0,
+    source: 'external'
+  };
+}
+
+async function checkExternalReplayAllowance(settings, provider, eventType) {
+  if (!settings.httpEndpoint) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REPLAY_COUNTER_HTTP_TIMEOUT_MS);
+  try {
+    const res = await fetch(settings.httpEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(settings.httpTokenConfigured ? { Authorization: `Bearer ${String(get('SELECT value FROM global_settings WHERE key = ?', ['replay_rate_limit_http_token'])?.value || '')}` } : {})
+      },
+      body: JSON.stringify({
+        provider: String(provider || 'any'),
+        eventType: String(eventType || 'any'),
+        perMinute: settings.perMinute,
+        minuteBucket: Math.floor(Date.now() / 60000)
+      }),
+      signal: controller.signal
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    if (!data || typeof data.allowed !== 'boolean') return null;
+    return {
+      allowed: Boolean(data.allowed),
+      source: 'http',
+      hits: Number(data.hits || 0)
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function isReplayAllowed(provider, eventType) {
   const settings = getReplayRateLimit();
   const limit = settings.perMinute;
   const minute = Math.floor(Date.now() / 60000);
   const key = `${String(provider || 'any')}:${String(eventType || 'any')}:${minute}`;
 
-  if (settings.persistentEnabled) {
+  if (settings.backend === 'http') {
+    const external = await checkExternalReplayAllowance(settings, provider, eventType);
+    if (external) return external.allowed;
+    // Fallback: if external counter is unavailable, degrade safely to sqlite.
+  }
+
+  if (settings.backend === 'sqlite' || settings.persistentEnabled) {
     cleanupReplayRateCountersIfNeeded(settings.counterRetentionMinutes);
     const currentHits = getReplayBucketHits(provider, eventType, minute);
     if (currentHits >= limit) return false;
@@ -1783,26 +1862,117 @@ function hasRecentSamePlaybookAction(alertKind, actionName, cooldownMs) {
   return Boolean(row);
 }
 
-function recordPlaybookAction({ alertKind, severity, actionName, beforeState, afterState, reason, rollbackState = null }) {
+function recordPlaybookAction({
+  alertKind,
+  severity,
+  actionName,
+  beforeState,
+  afterState,
+  reason,
+  rollbackState = null,
+  plan = null,
+  status = 'applied',
+  approvedBy = '',
+  approvedAt = null
+}) {
   const id = `playbook_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   run(
-    'INSERT INTO ops_playbook_actions (id, alert_kind, severity, action_name, status, before_json, after_json, reason, rollback_json, rollback_reason, created_at, rolled_back_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO ops_playbook_actions (id, alert_kind, severity, action_name, status, before_json, after_json, plan_json, reason, rollback_json, rollback_reason, approved_by, approved_at, created_at, rolled_back_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     [
       id,
       String(alertKind || 'unknown'),
       String(severity || 'low'),
       String(actionName || 'unknown'),
-      'applied',
+      String(status || 'applied'),
       JSON.stringify(beforeState || {}),
       JSON.stringify(afterState || {}),
+      JSON.stringify(plan || {}),
       String(reason || ''),
       JSON.stringify(rollbackState || {}),
       '',
+      String(approvedBy || ''),
+      Number.isFinite(Number(approvedAt)) ? Number(approvedAt) : null,
       Date.now(),
       null
     ]
   );
   return id;
+}
+
+function shouldRequireApproval(severity, playbookSettings) {
+  const mode = String(playbookSettings?.approvalMode || 'critical');
+  if (mode === 'manual') return true;
+  if (mode === 'critical') return String(severity || '').toLowerCase() === 'critical';
+  return false;
+}
+
+function hasRecentPendingApproval(actionName, alertKind, windowMs) {
+  const since = Date.now() - Math.max(60000, Number(windowMs || 900000));
+  const row = get(
+    'SELECT id FROM ops_playbook_actions WHERE action_name = ? AND alert_kind = ? AND status = ? AND created_at >= ? LIMIT 1',
+    [String(actionName || ''), String(alertKind || ''), 'pending_approval', since]
+  );
+  return Boolean(row);
+}
+
+function applyPlaybookPlan(actionName, plan) {
+  const normalizedPlan = plan && typeof plan === 'object' ? plan : {};
+
+  if (actionName === 'replay_batch_size_reduced') {
+    const nextBatch = Number(normalizedPlan.nextBatch);
+    if (!Number.isFinite(nextBatch)) return { applied: false, after: {}, rollback: {} };
+    const current = getReplayPolicy();
+    const next = Math.max(1, Math.min(200, Math.round(nextBatch)));
+    if (next === current.batchSize) return { applied: false, after: { replayBatchSize: current.batchSize }, rollback: { replayBatchSize: current.batchSize } };
+    setGlobalSetting('replay_batch_size', next);
+    return {
+      applied: true,
+      after: { replayBatchSize: next },
+      rollback: { replayBatchSize: current.batchSize }
+    };
+  }
+
+  if (actionName === 'replay_backoff_hardened') {
+    const baseDelayMs = Number(normalizedPlan.baseDelayMs);
+    const maxDelayMs = Number(normalizedPlan.maxDelayMs);
+    if (!Number.isFinite(baseDelayMs) || !Number.isFinite(maxDelayMs)) return { applied: false, after: {}, rollback: {} };
+    const current = getReplayPolicy();
+    const nextBase = Math.max(1000, Math.min(120000, Math.round(baseDelayMs)));
+    const nextMax = Math.max(nextBase, Math.min(3600000, Math.round(maxDelayMs)));
+    if (nextBase === current.baseDelayMs && nextMax === current.maxDelayMs) {
+      return {
+        applied: false,
+        after: { baseDelayMs: current.baseDelayMs, maxDelayMs: current.maxDelayMs },
+        rollback: { baseDelayMs: current.baseDelayMs, maxDelayMs: current.maxDelayMs }
+      };
+    }
+    setGlobalSetting('replay_backoff_base_ms', nextBase);
+    setGlobalSetting('replay_backoff_max_ms', nextMax);
+    return {
+      applied: true,
+      after: { baseDelayMs: nextBase, maxDelayMs: nextMax },
+      rollback: { baseDelayMs: current.baseDelayMs, maxDelayMs: current.maxDelayMs }
+    };
+  }
+
+  if (actionName === 'replay_window_paused') {
+    const pauseMs = Number(normalizedPlan.pauseMs);
+    const pauseUntil = Date.now() + Math.max(5000, Math.min(600000, Number.isFinite(pauseMs) ? pauseMs : 30000));
+    const candidates = all(
+      'SELECT id FROM webhook_jobs WHERE status = ? AND next_run < ? ORDER BY next_run ASC LIMIT 100',
+      ['pending', pauseUntil]
+    );
+    for (const row of candidates) {
+      run('UPDATE webhook_jobs SET next_run = ?, updated_at = ? WHERE id = ?', [pauseUntil, Date.now(), row.id]);
+    }
+    return {
+      applied: true,
+      after: { delayedJobs: candidates.length, pauseUntil },
+      rollback: {}
+    };
+  }
+
+  return { applied: false, after: {}, rollback: {} };
 }
 
 function runPlaybookRollbackGuards(snapshot, anomaly = null) {
@@ -1914,20 +2084,52 @@ function executeOpsAutoAction(kind, severity, snapshot, context = null) {
 
   if (countRecentPlaybookActions(60 * 60 * 1000) >= playbook.maxActionsPerHour) return null;
 
+  const requireApproval = shouldRequireApproval(severity, playbook);
+
+  const queuePendingAction = (actionName, plan, beforeState, reasonText) => {
+    if (hasRecentPendingApproval(actionName, kind, playbook.approvalWindowMs)) {
+      return { action: `${actionName}_awaiting_existing_approval`, queued: false };
+    }
+    const id = recordPlaybookAction({
+      alertKind: kind,
+      severity,
+      actionName,
+      status: 'pending_approval',
+      plan,
+      beforeState,
+      afterState: {},
+      reason: reasonText,
+      rollbackState: {}
+    });
+    return {
+      action: `${actionName}_queued_for_approval`,
+      queued: true,
+      approvalId: id,
+      approvalMode: playbook.approvalMode
+    };
+  };
+
   if (kind === 'ops_pending_jobs' || kind === 'ops_failed_jobs') {
     if (hasRecentSamePlaybookAction(kind, 'replay_batch_size_reduced', playbook.actionCooldownMs)) return null;
     const current = getReplayPolicy();
     const nextBatch = Math.max(3, Math.floor(current.batchSize * (1 - playbook.queueBatchReductionPct)));
     if (nextBatch === current.batchSize) return null;
-    setGlobalSetting('replay_batch_size', nextBatch);
+
+    const plan = { nextBatch };
+    if (requireApproval) {
+      return queuePendingAction('replay_batch_size_reduced', plan, { replayBatchSize: current.batchSize }, `queue_guard_${kind}`);
+    }
+
+    const applied = applyPlaybookPlan('replay_batch_size_reduced', plan);
+    if (!applied.applied) return null;
     recordPlaybookAction({
       alertKind: kind,
       severity,
       actionName: 'replay_batch_size_reduced',
       beforeState: { replayBatchSize: current.batchSize },
-      afterState: { replayBatchSize: nextBatch },
+      afterState: applied.after,
       reason: `queue_guard_${kind}`,
-      rollbackState: { replayBatchSize: current.batchSize }
+      rollbackState: applied.rollback
     });
     return {
       action: 'replay_batch_size_reduced',
@@ -1943,16 +2145,27 @@ function executeOpsAutoAction(kind, severity, snapshot, context = null) {
     const nextBase = Math.min(120000, Math.max(current.baseDelayMs, playbook.latencyBackoffFloorMs));
     const nextMax = Math.min(3600000, Math.max(current.maxDelayMs, nextBase * 2));
     if (nextBase === current.baseDelayMs && nextMax === current.maxDelayMs) return null;
-    setGlobalSetting('replay_backoff_base_ms', nextBase);
-    setGlobalSetting('replay_backoff_max_ms', nextMax);
+
+    const plan = { baseDelayMs: nextBase, maxDelayMs: nextMax };
+    if (requireApproval) {
+      return queuePendingAction(
+        'replay_backoff_hardened',
+        plan,
+        { baseDelayMs: current.baseDelayMs, maxDelayMs: current.maxDelayMs },
+        `latency_guard_${kind}`
+      );
+    }
+
+    const applied = applyPlaybookPlan('replay_backoff_hardened', plan);
+    if (!applied.applied) return null;
     recordPlaybookAction({
       alertKind: kind,
       severity,
       actionName: 'replay_backoff_hardened',
       beforeState: { baseDelayMs: current.baseDelayMs, maxDelayMs: current.maxDelayMs },
-      afterState: { baseDelayMs: nextBase, maxDelayMs: nextMax },
+      afterState: applied.after,
       reason: `latency_guard_${kind}`,
-      rollbackState: { baseDelayMs: current.baseDelayMs, maxDelayMs: current.maxDelayMs }
+      rollbackState: applied.rollback
     });
     return {
       action: 'replay_backoff_hardened',
@@ -1963,28 +2176,28 @@ function executeOpsAutoAction(kind, severity, snapshot, context = null) {
 
   if (kind === 'ops_anomaly_cluster' && playbook.allowOnAnomaly) {
     if (hasRecentSamePlaybookAction(kind, 'replay_window_paused', playbook.actionCooldownMs)) return null;
-    const pauseUntil = Date.now() + playbook.anomalyReplayPauseMs;
-    const candidates = all(
-      'SELECT id FROM webhook_jobs WHERE status = ? AND next_run < ? ORDER BY next_run ASC LIMIT 100',
-      ['pending', pauseUntil]
-    );
-    for (const row of candidates) {
-      run('UPDATE webhook_jobs SET next_run = ?, updated_at = ? WHERE id = ?', [pauseUntil, Date.now(), row.id]);
+    const plan = { pauseMs: playbook.anomalyReplayPauseMs };
+
+    if (requireApproval) {
+      return queuePendingAction('replay_window_paused', plan, {}, context?.maxZ ? `anomaly_z_${context.maxZ}` : 'anomaly');
     }
+
+    const applied = applyPlaybookPlan('replay_window_paused', plan);
+    if (!applied.applied) return null;
 
     recordPlaybookAction({
       alertKind: kind,
       severity,
       actionName: 'replay_window_paused',
       beforeState: { delayedJobs: 0 },
-      afterState: { delayedJobs: candidates.length, pauseUntil },
+      afterState: applied.after,
       reason: context?.maxZ ? `anomaly_z_${context.maxZ}` : 'anomaly',
-      rollbackState: {}
+      rollbackState: applied.rollback
     });
 
     return {
       action: 'replay_window_paused',
-      delayedJobs: candidates.length,
+      delayedJobs: Number(applied.after?.delayedJobs || 0),
       pauseMs: playbook.anomalyReplayPauseMs,
       reason: context?.maxZ ? `anomaly_z_${context.maxZ}` : 'anomaly'
     };
@@ -2981,7 +3194,7 @@ app.get('/api/webhooks/replay_rate_limit', async () => {
   const settings = getReplayRateLimit();
   const provider = 'any';
   const eventType = 'any';
-  const usage = getReplayRateLimitUsage(provider, eventType);
+  const usage = await getReplayRateLimitUsage(provider, eventType);
   return {
     ...settings,
     usage,
@@ -2993,6 +3206,9 @@ app.put('/api/webhooks/replay_rate_limit', async (req, reply) => {
   const perMinute = Number(req.body?.perMinute);
   const persistentEnabledRaw = req.body?.persistentEnabled;
   const counterRetentionMinutesRaw = Number(req.body?.counterRetentionMinutes);
+  const backendRaw = String(req.body?.backend || '').toLowerCase();
+  const httpEndpointRaw = String(req.body?.httpEndpoint || '').trim();
+  const httpTokenRaw = String(req.body?.httpToken || '');
   if (!Number.isFinite(perMinute)) return reply.code(400).send({ error: 'perMinute required' });
   const normalized = Math.max(1, Math.min(5000, perMinute));
   const current = getReplayRateLimit();
@@ -3000,12 +3216,16 @@ app.put('/api/webhooks/replay_rate_limit', async (req, reply) => {
   const counterRetentionMinutes = Number.isFinite(counterRetentionMinutesRaw)
     ? Math.max(10, Math.min(1440, Math.round(counterRetentionMinutesRaw)))
     : current.counterRetentionMinutes;
+  const backend = ['memory', 'sqlite', 'http'].includes(backendRaw) ? backendRaw : current.backend;
   setGlobalSetting('replay_rate_limit_per_min', normalized);
   setGlobalSetting('replay_rate_limit_persistent_enabled', persistentEnabled ? 1 : 0);
   setGlobalSetting('replay_rate_limit_retention_min', counterRetentionMinutes);
+  setGlobalSetting('replay_rate_limit_backend', backend);
+  if (httpEndpointRaw || backend === 'http') setGlobalSetting('replay_rate_limit_http_endpoint', httpEndpointRaw || current.httpEndpoint || '');
+  if (httpTokenRaw) setGlobalSetting('replay_rate_limit_http_token', httpTokenRaw);
   cleanupReplayRateCountersIfNeeded(counterRetentionMinutes);
   const settings = getReplayRateLimit();
-  const usage = getReplayRateLimitUsage('any', 'any');
+  const usage = await getReplayRateLimitUsage('any', 'any');
   return {
     ...settings,
     usage,
@@ -3033,7 +3253,7 @@ app.post('/api/webhooks/replay/:id', async (req, reply) => {
   const row = get('SELECT * FROM webhook_jobs WHERE id = ? LIMIT 1', [id]);
   if (!row) return reply.code(404).send({ error: 'job not found' });
 
-  if (!isReplayAllowed(row.provider, row.event_type)) {
+  if (!(await isReplayAllowed(row.provider, row.event_type))) {
     return reply.code(429).send({ error: 'Replay rate limit exceeded for provider/event' });
   }
 
@@ -3067,7 +3287,7 @@ app.post('/api/webhooks/replay_failed', async (req) => {
   let rateLimited = 0;
   let replayed = 0;
   for (const row of rows) {
-    if (!isReplayAllowed(row.provider, row.event_type)) {
+    if (!(await isReplayAllowed(row.provider, row.event_type))) {
       rateLimited += 1;
       continue;
     }
@@ -3101,6 +3321,7 @@ app.get('/api/ops/backpressure', async () => {
   const baseline = buildOpsBaseline(adaptive.lookbackSnapshots);
   const thresholdPack = getEffectiveOpsThresholds(snapshot, baseline);
   const anomaly = detectOpsAnomaly(snapshot, baseline, adaptive);
+  const pendingPlaybookApprovals = Number(get('SELECT COUNT(*) as c FROM ops_playbook_actions WHERE status = ?', ['pending_approval'])?.c || 0);
   return {
     snapshot,
     worker: {
@@ -3128,7 +3349,8 @@ app.get('/api/ops/backpressure', async () => {
     opsThresholdMode: thresholdPack.mode,
     opsAdaptive: adaptive,
     opsPlaybooks: getOpsPlaybookSettings(),
-    anomaly: anomaly || { detected: false }
+    anomaly: anomaly || { detected: false },
+    pendingPlaybookApprovals
   };
 });
 
@@ -3183,6 +3405,79 @@ app.get('/api/ops/playbooks/actions', async (req) => {
   return all('SELECT * FROM ops_playbook_actions ORDER BY created_at DESC LIMIT ?', [limit]);
 });
 
+app.get('/api/ops/playbooks/pending', async (req) => {
+  const limitRaw = Number(req.query?.limit ?? 25);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(200, Math.round(limitRaw))) : 25;
+  return all(
+    'SELECT * FROM ops_playbook_actions WHERE status = ? ORDER BY created_at DESC LIMIT ?',
+    ['pending_approval', limit]
+  );
+});
+
+app.post('/api/ops/playbooks/:id/approve', async (req, reply) => {
+  const id = String(req.params?.id || '').trim();
+  if (!id) return reply.code(400).send({ error: 'id required' });
+
+  const row = get('SELECT * FROM ops_playbook_actions WHERE id = ? LIMIT 1', [id]);
+  if (!row) return reply.code(404).send({ error: 'action not found' });
+  if (String(row.status) !== 'pending_approval') {
+    return reply.code(409).send({ error: 'action is not pending approval' });
+  }
+
+  let plan = {};
+  try {
+    plan = JSON.parse(String(row.plan_json || '{}'));
+  } catch {
+    plan = {};
+  }
+
+  const applied = applyPlaybookPlan(String(row.action_name || ''), plan);
+  if (!applied.applied) {
+    run('UPDATE ops_playbook_actions SET status = ?, rollback_reason = ?, approved_by = ?, approved_at = ? WHERE id = ?', [
+      'rejected',
+      'approval_applied_noop_or_invalid_plan',
+      String(req.body?.approvedBy || 'operator'),
+      Date.now(),
+      id
+    ]);
+    return { ok: false, id, status: 'rejected', reason: 'invalid_or_noop_plan' };
+  }
+
+  run(
+    'UPDATE ops_playbook_actions SET status = ?, after_json = ?, rollback_json = ?, approved_by = ?, approved_at = ? WHERE id = ?',
+    [
+      'applied',
+      JSON.stringify(applied.after || {}),
+      JSON.stringify(applied.rollback || {}),
+      String(req.body?.approvedBy || 'operator'),
+      Date.now(),
+      id
+    ]
+  );
+
+  return { ok: true, id, status: 'applied', after: applied.after };
+});
+
+app.post('/api/ops/playbooks/:id/reject', async (req, reply) => {
+  const id = String(req.params?.id || '').trim();
+  if (!id) return reply.code(400).send({ error: 'id required' });
+
+  const row = get('SELECT * FROM ops_playbook_actions WHERE id = ? LIMIT 1', [id]);
+  if (!row) return reply.code(404).send({ error: 'action not found' });
+  if (String(row.status) !== 'pending_approval') {
+    return reply.code(409).send({ error: 'action is not pending approval' });
+  }
+
+  const reason = String(req.body?.reason || 'manual_reject').slice(0, 240);
+  const approvedBy = String(req.body?.approvedBy || 'operator').slice(0, 80);
+  run(
+    'UPDATE ops_playbook_actions SET status = ?, rollback_reason = ?, approved_by = ?, approved_at = ? WHERE id = ?',
+    ['rejected', reason, approvedBy, Date.now(), id]
+  );
+
+  return { ok: true, id, status: 'rejected', reason };
+});
+
 app.post('/api/ops/playbooks/rollback_run', async () => {
   const snapshot = getOpsSnapshot();
   const adaptive = getOpsAdaptiveSettings();
@@ -3203,8 +3498,13 @@ app.put('/api/ops/playbooks', async (req) => {
     maxActionsPerHour,
     actionCooldownMs,
     autoRollbackMs,
-    rollbackOnStabilized
+    rollbackOnStabilized,
+    approvalMode,
+    approvalWindowMs
   } = req.body ?? {};
+
+  const approvalModeRaw = String(approvalMode || current.approvalMode || 'critical').toLowerCase();
+  const normalizedApprovalMode = ['auto', 'critical', 'manual'].includes(approvalModeRaw) ? approvalModeRaw : current.approvalMode;
 
   const next = {
     enabled: typeof enabled === 'boolean' ? enabled : current.enabled,
@@ -3216,7 +3516,9 @@ app.put('/api/ops/playbooks', async (req) => {
     maxActionsPerHour: Number.isFinite(Number(maxActionsPerHour)) ? Math.max(1, Math.min(60, Math.round(Number(maxActionsPerHour)))) : current.maxActionsPerHour,
     actionCooldownMs: Number.isFinite(Number(actionCooldownMs)) ? Math.max(30000, Math.min(3600000, Math.round(Number(actionCooldownMs)))) : current.actionCooldownMs,
     autoRollbackMs: Number.isFinite(Number(autoRollbackMs)) ? Math.max(60000, Math.min(7200000, Math.round(Number(autoRollbackMs)))) : current.autoRollbackMs,
-    rollbackOnStabilized: typeof rollbackOnStabilized === 'boolean' ? rollbackOnStabilized : current.rollbackOnStabilized
+    rollbackOnStabilized: typeof rollbackOnStabilized === 'boolean' ? rollbackOnStabilized : current.rollbackOnStabilized,
+    approvalMode: normalizedApprovalMode,
+    approvalWindowMs: Number.isFinite(Number(approvalWindowMs)) ? Math.max(60000, Math.min(7200000, Math.round(Number(approvalWindowMs)))) : current.approvalWindowMs
   };
 
   setGlobalSetting('ops_playbooks_enabled', next.enabled ? 1 : 0);
@@ -3229,6 +3531,8 @@ app.put('/api/ops/playbooks', async (req) => {
   setGlobalSetting('ops_playbook_action_cooldown_ms', next.actionCooldownMs);
   setGlobalSetting('ops_playbook_auto_rollback_ms', next.autoRollbackMs);
   setGlobalSetting('ops_playbook_rollback_on_stabilized', next.rollbackOnStabilized ? 1 : 0);
+  setGlobalSetting('ops_playbook_approval_mode', next.approvalMode);
+  setGlobalSetting('ops_playbook_approval_window_ms', next.approvalWindowMs);
   return next;
 });
 

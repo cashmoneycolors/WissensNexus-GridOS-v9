@@ -522,6 +522,43 @@ Nutzen:
 - Auto-Remediation wird auditierbar und begrenzt statt unkontrolliert
 - Stabilisierung fuehrt kontrolliert zur Rueckkehr auf Normalbetrieb
 
+## 22) Stufe 13: Distributed-Counter Adapter + Approval-Gates
+
+Datei: `server/index.mjs`, `server/db.mjs`, `src/components/Dashboard.tsx`
+
+Umgesetzt:
+
+- Replay-Rate-Limiter als Adapter (distributed-ready)
+  - Runtime-Modi: `memory | sqlite | http`
+  - API-Settings erweitert:
+    - `backend`
+    - `httpEndpoint` (+ optional token)
+  - `http`-Modus versucht externen Counter-Service, faellt bei Fehler robust auf sqlite-Logik zurueck
+  - Usage-Endpunkt bleibt konsistent fuer Dashboard (`usage`, `remaining`)
+- Playbook Approval-Gates
+  - Neue Settings:
+    - `approvalMode` (`auto|critical|manual`)
+    - `approvalWindowMs`
+  - Kritische/alle Aktionen koennen in Approval-Queue landen statt direkt zu wirken
+  - Neue APIs:
+    - `GET /api/ops/playbooks/pending`
+    - `POST /api/ops/playbooks/:id/approve`
+    - `POST /api/ops/playbooks/:id/reject`
+- Erweiterte Action-Audit-Struktur
+  - `ops_playbook_actions` um Approval-Felder erweitert (`plan_json`, `approved_by`, `approved_at`)
+  - Migrationssicher via `ensureColumn`
+- Dashboard Governance erweitert
+  - Replay-Backend/Endpoint konfigurierbar
+  - Approval-Mode + Approval-Window editierbar
+  - Pending-Approvals mit Approve/Reject Buttons
+  - Globaler Pending-Count im Backpressure-Kontext sichtbar
+
+Nutzen:
+
+- Limitierung kann lokal oder service-basiert betrieben werden (cluster-faehige Richtung)
+- Kritische Remediation ist freigabefaehig statt blind automatisch
+- Governance/Audit wird operativ sichtbar und steuerbar
+
 ## Bekannte Folgeaenderung
 
 Datei: `server/data.sqlite`
@@ -537,7 +574,7 @@ Datei: `server/data.sqlite`
 
 ## Nächste Optimierungsstufe (optional)
 
-1. Replay-Rate-Limiter von lokal-persistent auf verteilte Counter (Redis/Service) erweitern.
-2. Playbook-Orchestrierung mit mehrstufigen Runbooks (inkl. Approval-Gates) erweitern.
+1. Externen Counter-Service konkret anbinden (Redis/Valkey) inkl. Health/Fallback-Metriken.
+2. Mehrstufige Runbooks mit sequenziellen Steps und Timeouts pro Aktion ausrollen.
 3. PayPal-Sandbox/Live-Umschaltung fuer native Verify-API per Runtime-Setting.
 4. Geplante Report-Distribution (taeglicher Versand via SMTP/Webhook).

@@ -67,6 +67,7 @@ type BackpressureSnapshot = {
   opsAdaptive?: OpsAdaptiveSettings;
   opsPlaybooks?: OpsPlaybookSettings;
   anomaly?: AnomalyState;
+  pendingPlaybookApprovals?: number;
 };
 
 type OpsHistoryRow = {
@@ -102,6 +103,10 @@ type ReplayRateLimit = {
   perMinute: number;
   persistentEnabled: boolean;
   counterRetentionMinutes: number;
+  backend?: 'memory' | 'sqlite' | 'http';
+  httpEndpoint?: string;
+  httpConfigured?: boolean;
+  httpTokenConfigured?: boolean;
   usage?: {
     minuteBucket: number;
     provider: string;
@@ -129,6 +134,8 @@ type OpsPlaybookSettings = {
   actionCooldownMs: number;
   autoRollbackMs: number;
   rollbackOnStabilized: boolean;
+  approvalMode: 'auto' | 'critical' | 'manual';
+  approvalWindowMs: number;
 };
 
 type OpsPlaybookActionRow = {
@@ -183,9 +190,10 @@ export default function Dashboard({ metrics }: Props) {
   const [opsThresholds, setOpsThresholds] = useState<OpsThresholds>({ pendingJobs: 60, failedJobs: 5, p95LatencyMs: 700, errorRate: 0.05 });
   const [opsThresholdMode, setOpsThresholdMode] = useState<'fixed' | 'adaptive'>('fixed');
   const [opsAdaptive, setOpsAdaptive] = useState<OpsAdaptiveSettings>({ enabled: true, lookbackSnapshots: 60, sensitivity: 2.2, minBaselineSamples: 20 });
-  const [opsPlaybooks, setOpsPlaybooks] = useState<OpsPlaybookSettings>({ enabled: true, criticalOnly: true, allowOnAnomaly: true, queueBatchReductionPct: 0.35, latencyBackoffFloorMs: 10000, anomalyReplayPauseMs: 30000, maxActionsPerHour: 8, actionCooldownMs: 300000, autoRollbackMs: 900000, rollbackOnStabilized: true });
-  const [replayRateLimit, setReplayRateLimit] = useState<ReplayRateLimit>({ perMinute: 30, persistentEnabled: true, counterRetentionMinutes: 180 });
+  const [opsPlaybooks, setOpsPlaybooks] = useState<OpsPlaybookSettings>({ enabled: true, criticalOnly: true, allowOnAnomaly: true, queueBatchReductionPct: 0.35, latencyBackoffFloorMs: 10000, anomalyReplayPauseMs: 30000, maxActionsPerHour: 8, actionCooldownMs: 300000, autoRollbackMs: 900000, rollbackOnStabilized: true, approvalMode: 'critical', approvalWindowMs: 900000 });
+  const [replayRateLimit, setReplayRateLimit] = useState<ReplayRateLimit>({ perMinute: 30, persistentEnabled: true, counterRetentionMinutes: 180, backend: 'sqlite', httpEndpoint: '' });
   const [playbookActions, setPlaybookActions] = useState<OpsPlaybookActionRow[]>([]);
+  const [pendingApprovals, setPendingApprovals] = useState<OpsPlaybookActionRow[]>([]);
   const [dailyReport, setDailyReport] = useState<DailyReport | null>(null);
   const [reportDate, setReportDate] = useState('');
   const [lastExportInfo, setLastExportInfo] = useState('');
@@ -228,10 +236,13 @@ export default function Dashboard({ metrics }: Props) {
         .catch(() => setOpsAlerts([]));
       apiGet<ReplayRateLimit>('/api/webhooks/replay_rate_limit')
         .then(setReplayRateLimit)
-        .catch(() => setReplayRateLimit({ perMinute: 30, persistentEnabled: true, counterRetentionMinutes: 180 }));
+        .catch(() => setReplayRateLimit({ perMinute: 30, persistentEnabled: true, counterRetentionMinutes: 180, backend: 'sqlite', httpEndpoint: '' }));
       apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10')
         .then((rows) => setPlaybookActions(Array.isArray(rows) ? rows : []))
         .catch(() => setPlaybookActions([]));
+      apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/pending?limit=10')
+        .then((rows) => setPendingApprovals(Array.isArray(rows) ? rows : []))
+        .catch(() => setPendingApprovals([]));
       apiGet<DailyReport>(`/api/ops/report/daily${reportDate ? `?date=${encodeURIComponent(reportDate)}` : ''}`)
         .then(setDailyReport)
         .catch(() => setDailyReport(null));
@@ -365,8 +376,44 @@ export default function Dashboard({ metrics }: Props) {
     try {
       const next = await apiSend<OpsPlaybookSettings>('/api/ops/playbooks', 'PUT', opsPlaybooks);
       setOpsPlaybooks(next);
-      const rows = await apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10');
+      const [rows, pending] = await Promise.all([
+        apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10'),
+        apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/pending?limit=10')
+      ]);
       setPlaybookActions(Array.isArray(rows) ? rows : []);
+      setPendingApprovals(Array.isArray(pending) ? pending : []);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const approvePlaybookAction = async (id: string) => {
+    if (!id || opsBusy) return;
+    setOpsBusy(true);
+    try {
+      await apiSend(`/api/ops/playbooks/${id}/approve`, 'POST', { approvedBy: 'dashboard' });
+      const [rows, pending] = await Promise.all([
+        apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10'),
+        apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/pending?limit=10')
+      ]);
+      setPlaybookActions(Array.isArray(rows) ? rows : []);
+      setPendingApprovals(Array.isArray(pending) ? pending : []);
+    } finally {
+      setOpsBusy(false);
+    }
+  };
+
+  const rejectPlaybookAction = async (id: string) => {
+    if (!id || opsBusy) return;
+    setOpsBusy(true);
+    try {
+      await apiSend(`/api/ops/playbooks/${id}/reject`, 'POST', { reason: 'dashboard_reject', approvedBy: 'dashboard' });
+      const [rows, pending] = await Promise.all([
+        apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10'),
+        apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/pending?limit=10')
+      ]);
+      setPlaybookActions(Array.isArray(rows) ? rows : []);
+      setPendingApprovals(Array.isArray(pending) ? pending : []);
     } finally {
       setOpsBusy(false);
     }
@@ -377,8 +424,12 @@ export default function Dashboard({ metrics }: Props) {
     setOpsBusy(true);
     try {
       await apiSend('/api/ops/playbooks/rollback_run', 'POST', {});
-      const rows = await apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10');
+      const [rows, pending] = await Promise.all([
+        apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/actions?limit=10'),
+        apiGet<OpsPlaybookActionRow[]>('/api/ops/playbooks/pending?limit=10')
+      ]);
       setPlaybookActions(Array.isArray(rows) ? rows : []);
+      setPendingApprovals(Array.isArray(pending) ? pending : []);
     } finally {
       setOpsBusy(false);
     }
@@ -724,6 +775,23 @@ export default function Dashboard({ metrics }: Props) {
                 />
                 persistent
               </label>
+              <select
+                value={replayRateLimit.backend || 'sqlite'}
+                onChange={(e) => setReplayRateLimit((p) => ({ ...p, backend: e.target.value as 'memory' | 'sqlite' | 'http' }))}
+                className="rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+                aria-label="Replay backend"
+              >
+                <option value="sqlite">sqlite</option>
+                <option value="memory">memory</option>
+                <option value="http">http</option>
+              </select>
+              <input
+                value={replayRateLimit.httpEndpoint || ''}
+                onChange={(e) => setReplayRateLimit((p) => ({ ...p, httpEndpoint: e.target.value }))}
+                placeholder="external counter endpoint"
+                aria-label="Replay external endpoint"
+                className="min-w-[220px] rounded border border-slate-800/80 bg-black/30 px-2 py-1 text-xs"
+              />
               <Button className="text-xs" onClick={saveReplayRateLimit} disabled={opsBusy}>Save</Button>
             </div>
             <div className="mt-1 text-[11px] text-slate-500">
@@ -773,7 +841,7 @@ export default function Dashboard({ metrics }: Props) {
         </Card>
 
         <Card className="p-4 sm:col-span-2 lg:col-span-3">
-          <div className="text-xs font-semibold text-slate-400">Stage 11: Adaptive Ops + Playbooks</div>
+          <div className="text-xs font-semibold text-slate-400">Stage 13: Distributed Counters + Approval Gates</div>
           <div className="mt-3 grid gap-3 lg:grid-cols-2">
             <div className="rounded border border-slate-800/80 bg-slate-950/30 p-3">
               <div className="flex items-center justify-between">
@@ -906,6 +974,25 @@ export default function Dashboard({ metrics }: Props) {
                   aria-label="Playbook auto rollback ms"
                   className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
                 />
+                <select
+                  value={opsPlaybooks.approvalMode}
+                  onChange={(e) => setOpsPlaybooks((p) => ({ ...p, approvalMode: e.target.value as 'auto' | 'critical' | 'manual' }))}
+                  aria-label="Playbook approval mode"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                >
+                  <option value="auto">approval auto</option>
+                  <option value="critical">approval critical</option>
+                  <option value="manual">approval manual</option>
+                </select>
+                <input
+                  type="number"
+                  min={60000}
+                  max={7200000}
+                  value={opsPlaybooks.approvalWindowMs}
+                  onChange={(e) => setOpsPlaybooks((p) => ({ ...p, approvalWindowMs: Number(e.target.value || 900000) }))}
+                  aria-label="Playbook approval window ms"
+                  className="rounded border border-slate-800/80 bg-black/30 px-2 py-1"
+                />
               </div>
               <div className="mt-2 flex flex-wrap gap-2">
                 <label className="flex items-center gap-2 text-xs text-slate-300">
@@ -920,6 +1007,21 @@ export default function Dashboard({ metrics }: Props) {
               <div className="mt-2 flex gap-2">
                 <Button className="text-xs" onClick={saveOpsPlaybooks} disabled={opsBusy}>Save Playbooks</Button>
                 <Button className="text-xs" onClick={runPlaybookRollback} disabled={opsBusy}>Run Rollback Guard</Button>
+              </div>
+              <div className="mt-2 text-[11px] text-slate-400">
+                Pending approvals: {pendingApprovals.length} (global: {ops?.pendingPlaybookApprovals ?? pendingApprovals.length})
+              </div>
+              <div className="mt-1 max-h-24 overflow-auto custom-scrollbar space-y-1">
+                {pendingApprovals.map((a) => (
+                  <div key={a.id} className="rounded border border-amber-500/30 bg-amber-950/20 px-2 py-1 text-[11px] text-slate-200">
+                    <div>{a.action_name} · {a.severity}</div>
+                    <div className="mt-1 flex gap-1">
+                      <Button className="text-[10px]" onClick={() => approvePlaybookAction(a.id)} disabled={opsBusy}>Approve</Button>
+                      <Button className="text-[10px]" onClick={() => rejectPlaybookAction(a.id)} disabled={opsBusy}>Reject</Button>
+                    </div>
+                  </div>
+                ))}
+                {pendingApprovals.length === 0 && <div className="text-[11px] text-slate-500">Keine ausstehenden Approvals.</div>}
               </div>
               <div className="mt-2 max-h-24 overflow-auto custom-scrollbar space-y-1">
                 {playbookActions.map((a) => (

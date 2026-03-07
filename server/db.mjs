@@ -336,9 +336,12 @@ export function migrate() {
       status TEXT NOT NULL,
       before_json TEXT NOT NULL,
       after_json TEXT NOT NULL,
+      plan_json TEXT NOT NULL,
       reason TEXT NOT NULL,
       rollback_json TEXT NOT NULL,
       rollback_reason TEXT NOT NULL,
+      approved_by TEXT NOT NULL,
+      approved_at INTEGER,
       created_at INTEGER NOT NULL,
       rolled_back_at INTEGER
     );
@@ -365,6 +368,9 @@ export function migrate() {
   ensureColumn('product_rules', 'min_words', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('product_rules', 'max_words', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('product_meta', 'word_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('ops_playbook_actions', 'plan_json', 'TEXT NOT NULL DEFAULT "{}"');
+  ensureColumn('ops_playbook_actions', 'approved_by', 'TEXT NOT NULL DEFAULT ""');
+  ensureColumn('ops_playbook_actions', 'approved_at', 'INTEGER');
 }
 
 export function all(sql, params = []) {
